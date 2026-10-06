@@ -16,7 +16,7 @@ import sys
 import threading
 import uuid
 
-from . import client, config
+from . import client, config, system_sense
 from .background import BackgroundManager, should_auto_queue, extract_think_markers
 from .critic import Critic
 from .memory import Memory
@@ -122,6 +122,12 @@ class JarvsSession:
         recall = self.memory.recall_block(user_input)
         if recall:
             head += "\n\n" + recall
+        # Ground any host/time/location question in real OS telemetry (geolocation
+        # only when the question is actually about location, so we don't ping the
+        # geo service for a plain "what's the CPU load?").
+        if config.SYSTEM_SENSE and system_sense.needs_system_info(user_input):
+            head += "\n\n" + system_sense.summary_block(
+                include_geo=system_sense.needs_location(user_input))
         return head
 
     def reply(self, user_input: str, learn: bool = True) -> str:
@@ -254,6 +260,7 @@ _HELP = (
     "/metadream [run]     meta-dreaming focus areas; 'run' forces a distill pass\n"
     "/background <task>   queue a deferred task (runs off-conversation, may use web)\n"
     "/jobs                recent background jobs + their results\n"
+    "/system              live host telemetry (CPU/GPU/mem/time/location)\n"
     "/status              backend + voice + memory status\n"
     "/reset               clear the conversation (memory persists)\n"
     "/help                this list\n"
@@ -285,6 +292,8 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
             print(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
         if session.background is not None:
             print(f"  · {session.background.status()}")
+        if config.SYSTEM_SENSE:
+            print(f"  · {system_sense.status()}")
         print(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
               f"turns={len(session.history)}")
     elif cmd == "voice":
@@ -330,6 +339,8 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
                 star = "★" if a["pairs"] >= snap["promote_min_pairs"] else " "
                 print(f"    {star} {a['area']} (sessions={a['pairs']}, hits={a['hits']})"
                       + (f": {a['specific']}" if a["specific"] else ""))
+    elif cmd == "system":
+        print(system_sense.summary_block(include_geo=True))
     elif cmd == "background":
         if session.background is None:
             print("  · background work is disabled (JARVS_BACKGROUND=0)")

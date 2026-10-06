@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from . import client, config
+from . import client, config, system_sense
 from .chat import JarvsSession
 
 # The production bundle Vite writes (web/ -> jarvs/web_dist via vite.config.js).
@@ -141,6 +141,14 @@ class JarvsHandler(BaseHTTPRequestHandler):
             return {"enabled": False, "jobs": []}
         return {"enabled": True, "jobs": self.session.background.recent(12)}
 
+    def _system_payload(self) -> dict:
+        if not config.SYSTEM_SENSE:
+            return {"enabled": False}
+        # Geo is cached; snapshot(include_geo=True) only hits the network on a miss.
+        snap = system_sense.snapshot(include_geo=True)
+        snap["enabled"] = True
+        return snap
+
     # -- GET ------------------------------------------------------------------ #
 
     def do_GET(self):
@@ -151,6 +159,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._send_json(self._stats_payload())
         elif route == "/api/jobs":
             self._send_json(self._jobs_payload())
+        elif route == "/api/system":
+            self._send_json(self._system_payload())
         elif route.startswith("/api/"):
             self.send_error(404, "Not found")
         elif not os.path.isdir(_WEB_DIR):

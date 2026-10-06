@@ -1,6 +1,7 @@
 import { motion } from "framer-motion";
 import {
-  Activity, Cpu, Database, Network, BrainCircuit, Volume2, VolumeX, Radio, ListChecks,
+  Activity, Cpu, MemoryStick, Thermometer, Gauge, BrainCircuit, ListChecks,
+  Volume2, VolumeX, Radio, MapPin, Clock,
 } from "lucide-react";
 
 const JOB_DOT = {
@@ -17,15 +18,10 @@ function Widget({ icon: Icon, label, value, unit, accent }) {
     >
       <div className="flex items-center gap-2">
         <Icon size={13} color={accent ? "#00d4ff" : "#8a94a3"} strokeWidth={1.5} />
-        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">
-          {label}
-        </span>
+        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">{label}</span>
       </div>
       <div className="mt-1.5 flex items-baseline gap-1">
-        <span
-          className="font-mono text-lg"
-          style={{ color: accent ? "#00d4ff" : "#d7dbe3" }}
-        >
+        <span className="font-mono text-lg" style={{ color: accent ? "#00d4ff" : "#d7dbe3" }}>
           {value}
         </span>
         {unit && <span className="font-mono text-[10px] text-slate-600">{unit}</span>}
@@ -34,19 +30,34 @@ function Widget({ icon: Icon, label, value, unit, accent }) {
   );
 }
 
-export default function DataDashboard({ stats, status, jobs = [], onToggleVoice }) {
+function SectionLabel({ children }) {
+  return (
+    <span className="font-mono text-[9px] tracking-[0.3em] text-slate-600">{children}</span>
+  );
+}
+
+const dash = (v) => (v === null || v === undefined ? "—" : v);
+
+export default function DataDashboard({ stats, status, jobs = [], system, onToggleVoice }) {
   const online = status?.backend_ok;
   const voiceOn = stats?.voice_enabled ?? status?.voice_enabled;
   const jobCounts = stats?.jobs || {};
   const activeJobs = (jobCounts.queued || 0) + (jobCounts.running || 0);
 
+  const cpu = system?.cpu || {};
+  const mem = system?.memory || {};
+  const gpu = (system?.gpu && system.gpu[0]) || {};
+  const geo = system?.geo;
+  const clock = system?.time?.local;
+  const where = geo
+    ? [geo.city, geo.country].filter(Boolean).join(", ")
+    : null;
+
   return (
     <aside className="hairline flex w-72 shrink-0 flex-col gap-4 border-y-0 border-r-0 bg-[#0b0c0e]/60 p-5 backdrop-blur-sm">
-      {/* system heartbeat */}
+      {/* heartbeat */}
       <div className="flex items-center justify-between">
-        <span className="font-mono text-[10px] tracking-[0.3em] text-slate-400">
-          SYSTEM
-        </span>
+        <span className="font-mono text-[10px] tracking-[0.3em] text-slate-400">SYSTEM</span>
         <span className="flex items-center gap-1.5 font-mono text-[10px]">
           <Radio size={11} color={online ? "#00d4ff" : "#e5484d"} strokeWidth={2} />
           <span style={{ color: online ? "#00d4ff" : "#e5484d" }}>
@@ -55,19 +66,39 @@ export default function DataDashboard({ stats, status, jobs = [], onToggleVoice 
         </span>
       </div>
 
-      <div className="grid grid-cols-2 gap-2.5">
-        <Widget icon={Activity} label="LATENCY" value={stats?.latency_ms ?? "—"} unit="ms" accent />
-        <Widget icon={Cpu} label="TOKENS" value={stats?.last_tokens ?? "—"} />
-        <Widget icon={Database} label="EPISODIC" value={stats?.episodic ?? "—"} />
-        <Widget icon={Database} label="SEMANTIC" value={stats?.semantic ?? "—"} />
-        <Widget icon={Network} label="LINKS" value={stats?.links ?? "—"} />
-        <Widget icon={BrainCircuit} label="FOCUS" value={stats?.focus_promoted ?? "—"} accent />
-        <Widget icon={ListChecks} label="JOBS" value={activeJobs} accent={activeJobs > 0} />
+      {/* live clock */}
+      {clock && (
+        <div className="flex items-center gap-2 font-mono text-[11px] text-slate-400">
+          <Clock size={12} color="#8a94a3" strokeWidth={1.5} />
+          <span>{clock}</span>
+        </div>
+      )}
+
+      {/* host telemetry */}
+      <div className="flex flex-col gap-2">
+        <SectionLabel>HOST</SectionLabel>
+        <div className="grid grid-cols-2 gap-2.5">
+          <Widget icon={Cpu} label="CPU" value={dash(cpu.util_pct)} unit="%" accent />
+          <Widget icon={Gauge} label="GPU" value={dash(gpu.util_pct)} unit="%" accent />
+          <Widget icon={MemoryStick} label="RAM" value={dash(mem.used_pct)} unit="%" />
+          <Widget icon={Thermometer} label="GPU °C" value={dash(gpu.temp_c)} />
+        </div>
+      </div>
+
+      {/* JARVS internals */}
+      <div className="flex flex-col gap-2">
+        <SectionLabel>JARVS</SectionLabel>
+        <div className="grid grid-cols-2 gap-2.5">
+          <Widget icon={Activity} label="LATENCY" value={dash(stats?.latency_ms)} unit="ms" accent />
+          <Widget icon={BrainCircuit} label="FOCUS" value={dash(stats?.focus_promoted)} />
+          <Widget icon={ListChecks} label="JOBS" value={activeJobs} accent={activeJobs > 0} />
+          <Widget icon={Activity} label="TURNS" value={dash(stats?.turns)} />
+        </div>
       </div>
 
       {/* recent background jobs */}
       <div className="hairline flex min-h-0 flex-1 flex-col rounded-md bg-[#0e0f12]/70 px-3 py-2.5">
-        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">BACKGROUND</span>
+        <SectionLabel>BACKGROUND</SectionLabel>
         <div className="stream mt-2 flex flex-col gap-2 overflow-y-auto">
           {jobs.length === 0 && (
             <span className="font-mono text-[10px] text-slate-600">no jobs yet</span>
@@ -85,13 +116,15 @@ export default function DataDashboard({ stats, status, jobs = [], onToggleVoice 
         </div>
       </div>
 
-      <div className="hairline rounded-md bg-[#0e0f12]/70 px-3 py-2">
-        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">TURNS</span>
-        <span className="ml-2 font-mono text-sm text-slate-300">{stats?.turns ?? 0}</span>
-      </div>
-
+      {/* footer: location + model + voice */}
       <div className="mt-auto flex flex-col gap-2">
-        <span className="font-mono text-[9px] tracking-[0.25em] text-slate-600 truncate">
+        {where && (
+          <span className="flex items-center gap-1.5 font-mono text-[10px] text-slate-500">
+            <MapPin size={11} color="#8a94a3" strokeWidth={1.5} />
+            <span className="truncate">{where}</span>
+          </span>
+        )}
+        <span className="font-mono text-[9px] tracking-[0.2em] text-slate-600 truncate">
           {status?.model || "—"}
         </span>
         <button

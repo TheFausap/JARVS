@@ -82,6 +82,14 @@ Background/agent-like layer added after the core build:
 - Surfaced in the web UI: `/api/jobs`, a JOBS widget + background list, and completed
   results appear in the transcript. REPL: `/background`, `/jobs`, live job events.
 - Not ported: idle web-learning, meditation, self-authored routines.
+- **System awareness** (`jarvs/system_sense.py`): live host telemetry from the OS —
+  CPU load/util, memory, NVIDIA GPU (util/VRAM/temp via nvidia-smi), disk, thermals,
+  uptime, local clock/timezone, network (gateway/local IP), and IP-based geolocation
+  (router's public IP → ip-api.com, cached JARVS_GEO_TTL, gated by JARVS_GEOLOCATION +
+  JARVS_ALLOW_WEB). A `[SYSTEM STATUS]` block is injected into the reply when the user
+  asks about the host/time/location, so answers are grounded in real numbers. Web UI:
+  `/api/system` + a HOST section (CPU/GPU/RAM/temp), live clock, and location. REPL:
+  `/system`. Geolocation is IP-based, not wifi-BSSID (keyless, approximate, opt-out).
 
 # OPEN QUESTIONS
 

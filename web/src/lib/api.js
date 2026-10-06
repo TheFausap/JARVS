@@ -20,6 +20,12 @@ export async function getJobs() {
   return r.json();
 }
 
+export async function getSystem() {
+  const r = await fetch("/api/system");
+  if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
 export async function setVoice(enabled) {
   const r = await fetch("/api/voice", {
     method: "POST",

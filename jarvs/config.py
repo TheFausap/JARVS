@@ -104,6 +104,17 @@ ALLOW_WEB = _flag("JARVS_ALLOW_WEB", True)
 BACKGROUND_WEB = _flag("JARVS_BACKGROUND_WEB", True)
 
 
+# --- system awareness (hardware / OS / geolocation) --------------------------- #
+
+SYSTEM_SENSE = _flag("JARVS_SYSTEM_SENSE", True)
+# IP-based geolocation (the router's public IP → a geo service). Respects ALLOW_WEB.
+GEOLOCATION = _flag("JARVS_GEOLOCATION", True)
+GEO_TTL = _int("JARVS_GEO_TTL", 21600, floor=60)   # cache seconds (location is stable)
+GEO_URL = _env("JARVS_GEO_URL",
+               "http://ip-api.com/json/?fields=status,message,city,regionName,"
+               "country,lat,lon,timezone,isp,query")
+
+
 # --- background jobs (autonomous deferred work) ------------------------------- #
 
 BACKGROUND_ENABLED = _flag("JARVS_BACKGROUND", True)
