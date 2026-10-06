@@ -131,7 +131,15 @@ class JarvsHandler(BaseHTTPRequestHandler):
             "focus_promoted": meta["promoted_areas"] if meta else 0,
             "focus_pending": meta["pending_lines"] if meta else 0,
             "voice_enabled": self.session.voice.enabled,
+            "jobs": (self.session.background.counts()
+                     if self.session.background else
+                     {"queued": 0, "running": 0, "completed": 0, "failed": 0}),
         }
+
+    def _jobs_payload(self) -> dict:
+        if self.session.background is None:
+            return {"enabled": False, "jobs": []}
+        return {"enabled": True, "jobs": self.session.background.recent(12)}
 
     # -- GET ------------------------------------------------------------------ #
 
@@ -141,6 +149,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._send_json(self._status_payload())
         elif route == "/api/stats":
             self._send_json(self._stats_payload())
+        elif route == "/api/jobs":
+            self._send_json(self._jobs_payload())
         elif route.startswith("/api/"):
             self.send_error(404, "Not found")
         elif not os.path.isdir(_WEB_DIR):

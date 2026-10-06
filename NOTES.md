@@ -66,6 +66,23 @@ reusing JarvsSession/client/memory/critic. All four components built
 state machine, dashboard polling, and voice toggle verified against the live model.
 Run: `cd web && npm run build` then `python -m jarvs.server` (see web/README.md).
 
+# AGENT CAPABILITIES (2026-10-06)
+
+Background/agent-like layer added after the core build:
+- **Background jobs** (`jarvs/background.py`): a persisted queue + single worker daemon.
+  Tasks are deferred off the conversation path, each gathering its own context and
+  (optionally) doing one live web search / URL fetch, then running a bounded analysis
+  and storing the result in memory. Retries transient timeouts; emits status events.
+  Triggered by plain-language requests ("research X in the background, tell me when
+  done"), a `/background <task>` command, or model `[[THINK: …]]` markers.
+- **Web research** (`jarvs/web_access.py`): DuckDuckGo search + URL fetch (`ddgs`,
+  optional). Used by background jobs; idle browse-to-learn deliberately deferred.
+- **Auto-dream cadence**: the associative consolidation pass now runs automatically
+  every `JARVS_DREAM_EVERY` (default 12) turns, off the reply path.
+- Surfaced in the web UI: `/api/jobs`, a JOBS widget + background list, and completed
+  results appear in the transcript. REPL: `/background`, `/jobs`, live job events.
+- Not ported: idle web-learning, meditation, self-authored routines.
+
 # OPEN QUESTIONS
 
 - (resolved — see DECISIONS)

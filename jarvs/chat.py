@@ -17,6 +17,7 @@ import threading
 import uuid
 
 from . import client, config
+from .background import BackgroundManager, should_auto_queue, extract_think_markers
 from .critic import Critic
 from .memory import Memory
 from .meta_dreaming import MetaDreamer
@@ -70,6 +71,18 @@ class JarvsSession:
                 session_id=self.session_id,
                 generate_fn=client.generate,
                 focus_fn=focus_fn)
+
+        # Autonomous background work (deferred tasks + optional web research).
+        self.background: BackgroundManager | None = None
+        if config.BACKGROUND_ENABLED:
+            self.background = BackgroundManager(
+                generate_fn=client.generate,
+                store_path=os.path.join(str(config.DATA_DIR), "background_jobs.json"),
+                persona=self.system,
+                memory_fn=lambda t: self.memory.remember_fact(t, source="background"))
+
+        # Turn counter driving the automatic dream (associative consolidation) cadence.
+        self._turns_since_dream = 0
 
     # -- logging seam ---------------------------------------------------------- #
 
@@ -125,31 +138,56 @@ class JarvsSession:
             reply = (f"[backend error] {client.LAST_GENERATION_ERROR}"
                      if client.LAST_GENERATION_ERROR else "[no reply]")
         else:
+            reply = self._dispatch_background(user_input, reply)
             self.history.append({"role": "assistant", "content": reply})
             # Persist the exchange to external memory so it survives this session.
             self.memory.remember_exchange(user_input, reply)
-            # Critique + meta-dreaming run OFF the reply path (background thread) so
-            # they never add latency to the turn the user is waiting on.
-            if learn and self.critic is not None:
+            # Critique + meta-dreaming + the dream cadence run OFF the reply path
+            # (background thread) so they never add latency to the turn.
+            if learn and self._wants_learning():
                 threading.Thread(target=self.run_learning,
                                  args=(user_input, reply), daemon=True).start()
         return reply
+
+    def _wants_learning(self) -> bool:
+        return bool(self.critic or self.meta_dreamer or config.DREAM_EVERY > 0)
+
+    def _dispatch_background(self, user_input: str, reply: str) -> str:
+        """Queue any deferred work this turn implies — model-emitted ``[[THINK:]]``
+        markers and plain-language 'do it in the background' requests — and return the
+        reply with the markers stripped so they are never shown, spoken, or stored."""
+        if self.background is None:
+            return reply
+        clean, tasks = extract_think_markers(reply)
+        for task in tasks:
+            self.background.queue(task)
+        if should_auto_queue(user_input):
+            self.background.queue(user_input,
+                                  context=self.memory.recall_block(user_input))
+        return clean
 
     def run_learning(self, user_input: str, reply: str) -> dict:
         """Grade the reply and, when enough new critiques have accumulated, run a
         meta-dreaming pass that may sharpen the critic. Synchronous and best-effort —
         reply() dispatches it on a background thread; tests call it directly."""
-        result: dict = {"critique": {}, "distilled": 0}
-        if self.critic is None:
-            return result
-        try:
-            result["critique"] = self.critic.critique(user_input, reply)
-        except Exception:  # noqa: BLE001
-            pass
+        result: dict = {"critique": {}, "distilled": 0, "dreamed": None}
+        if self.critic is not None:
+            try:
+                result["critique"] = self.critic.critique(user_input, reply)
+            except Exception:  # noqa: BLE001
+                pass
         if self.meta_dreamer is not None:
             try:
                 if self.meta_dreamer.should_distill():
                     result["distilled"] = self.meta_dreamer.distill()
+            except Exception:  # noqa: BLE001
+                pass
+        # Automatic associative-consolidation ("dream") cadence.
+        self._turns_since_dream += 1
+        if config.DREAM_EVERY > 0 and self._turns_since_dream >= config.DREAM_EVERY:
+            self._turns_since_dream = 0
+            try:
+                result["dreamed"] = self.memory.dream()
             except Exception:  # noqa: BLE001
                 pass
         return result
@@ -179,11 +217,12 @@ class JarvsSession:
             client.LAST_GENERATION_ERROR = (client.LAST_GENERATION_ERROR
                                             or "empty reply")
             return
+        reply = self._dispatch_background(user_input, reply)
         self.history.append({"role": "assistant", "content": reply})
         self.memory.remember_exchange(user_input, reply)
         if speak and self.speak:
             self.voice.speak(reply)
-        if learn and self.critic is not None:
+        if learn and self._wants_learning():
             threading.Thread(target=self.run_learning,
                              args=(user_input, reply), daemon=True).start()
 
@@ -213,6 +252,8 @@ _HELP = (
     "/dream               weave associative links across stored memories\n"
     "/critic              self-critique stats (last verdict + pending log lines)\n"
     "/metadream [run]     meta-dreaming focus areas; 'run' forces a distill pass\n"
+    "/background <task>   queue a deferred task (runs off-conversation, may use web)\n"
+    "/jobs                recent background jobs + their results\n"
     "/status              backend + voice + memory status\n"
     "/reset               clear the conversation (memory persists)\n"
     "/help                this list\n"
@@ -242,6 +283,8 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
                   f"{snap['total_areas']} focus areas")
         else:
             print(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
+        if session.background is not None:
+            print(f"  · {session.background.status()}")
         print(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
               f"turns={len(session.history)}")
     elif cmd == "voice":
@@ -287,9 +330,49 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
                 star = "★" if a["pairs"] >= snap["promote_min_pairs"] else " "
                 print(f"    {star} {a['area']} (sessions={a['pairs']}, hits={a['hits']})"
                       + (f": {a['specific']}" if a["specific"] else ""))
+    elif cmd == "background":
+        if session.background is None:
+            print("  · background work is disabled (JARVS_BACKGROUND=0)")
+        elif not arg:
+            print("  · usage: /background <task to work on>")
+        else:
+            job = session.background.queue(arg)
+            print(f"  · queued job {job['id']} — I'll work on it and report back"
+                  if job else "  · not queued (queue full, duplicate, or too short)")
+    elif cmd == "jobs":
+        if session.background is None:
+            print("  · background work is disabled")
+        else:
+            print(f"  · {session.background.status()}")
+            for j in session.background.recent(8):
+                line = f"    [{j['status']}] {j['id']} · {j['task'][:60]}"
+                print(line)
+                if j["status"] == "completed" and j.get("result"):
+                    print(f"        → {j['result'][:200]}"
+                          + ("…" if len(j['result']) > 200 else ""))
+                elif j["status"] == "failed" and j.get("error"):
+                    print(f"        ✗ {j['error'][:160]}")
     else:
         print(f"  · unknown command: /{cmd} (try /help)")
     return True
+
+
+def _flush_background(session: JarvsSession) -> None:
+    """Print any background job events that arrived since the last prompt."""
+    if session.background is None:
+        return
+    for ev in session.background.drain_events():
+        if ev["kind"] == "queued":
+            print(f"\n  ⟡ background job {ev['id']} queued: {ev['task'][:70]}")
+        elif ev["kind"] == "completed":
+            job = next((j for j in session.background.recent(40)
+                        if j["id"] == ev["id"]), None)
+            res = (job or {}).get("result", "")
+            print(f"\n  ⟡ background job {ev['id']} complete — {ev['task'][:60]}")
+            if res:
+                print(f"    {res[:400]}" + ("…" if len(res) > 400 else ""))
+        elif ev["kind"] == "failed":
+            print(f"\n  ⟡ background job {ev['id']} failed: {ev['task'][:60]}")
 
 
 def main() -> None:
@@ -299,7 +382,10 @@ def main() -> None:
     print(f"  · {detail}")
     print(f"  · {session.voice.status()}")
     print(f"  · {session.memory.status()}")
+    if session.background is not None:
+        print(f"  · {session.background.status()}")
     while True:
+        _flush_background(session)
         try:
             line = input("\nyou › ").strip()
         except (EOFError, KeyboardInterrupt):

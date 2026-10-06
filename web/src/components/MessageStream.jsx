@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 
 // Clean, bubble-less transcript: user messages left-aligned, JARVS right-aligned,
 // separated by hairline dividers and clear typography.
-function Message({ role, text, streaming }) {
+function Message({ role, text, streaming, background }) {
   const isUser = role === "user";
   return (
     <motion.div
@@ -16,7 +16,7 @@ function Message({ role, text, streaming }) {
         className="font-mono text-[10px] tracking-[0.25em]"
         style={{ color: isUser ? "#4b5563" : "#00d4ff" }}
       >
-        {isUser ? "OPERATOR" : "JARVS"}
+        {isUser ? "OPERATOR" : background ? "JARVS · BACKGROUND" : "JARVS"}
       </span>
       <div
         className={`max-w-[80%] leading-relaxed whitespace-pre-wrap text-[15px] ${
@@ -49,7 +49,8 @@ export default function MessageStream({ messages }) {
       <div className="mx-auto max-w-3xl divide-y divide-[#14161b]">
         <AnimatePresence initial={false}>
           {messages.map((m) => (
-            <Message key={m.id} role={m.role} text={m.text} streaming={m.streaming} />
+            <Message key={m.id} role={m.role} text={m.text}
+                     streaming={m.streaming} background={m.background} />
           ))}
         </AnimatePresence>
       </div>

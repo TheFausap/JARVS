@@ -14,6 +14,12 @@ export async function getStats() {
   return r.json();
 }
 
+export async function getJobs() {
+  const r = await fetch("/api/jobs");
+  if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
 export async function setVoice(enabled) {
   const r = await fetch("/api/voice", {
     method: "POST",

@@ -3,7 +3,7 @@ import StatusRing from "./components/StatusRing.jsx";
 import MessageStream from "./components/MessageStream.jsx";
 import DataDashboard from "./components/DataDashboard.jsx";
 import InputTerminal from "./components/InputTerminal.jsx";
-import { getStatus, getStats, setVoice, streamChat } from "./lib/api.js";
+import { getStatus, getStats, getJobs, setVoice, streamChat } from "./lib/api.js";
 
 let _id = 0;
 const nextId = () => `m${_id++}`;
@@ -14,9 +14,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [stats, setStats] = useState(null);
   const [status, setStatus] = useState(null);
+  const [jobs, setJobs] = useState([]);
   const busyRef = useRef(false);
+  const seenDoneRef = useRef(new Set());
+  const firstJobsRef = useRef(true);
 
-  // Initial status + periodic dashboard polling.
+  // Initial status + periodic dashboard / jobs polling.
   useEffect(() => {
     let alive = true;
     getStatus().then((s) => alive && setStatus(s)).catch(() => {});
@@ -28,6 +31,25 @@ export default function App() {
           if (!busyRef.current) setState(s.backend_ok ? "idle" : "offline");
         })
         .catch(() => alive && !busyRef.current && setState("offline"));
+      getJobs()
+        .then((d) => {
+          if (!alive || !d.enabled) return;
+          setJobs(d.jobs || []);
+          // Surface newly completed jobs into the transcript as background replies.
+          for (const j of d.jobs || []) {
+            if (j.status === "completed" && !seenDoneRef.current.has(j.id)) {
+              seenDoneRef.current.add(j.id);
+              if (!firstJobsRef.current && j.result) {
+                setMessages((m) => [...m, {
+                  id: nextId(), role: "assistant", background: true,
+                  text: `⟡ Background task — ${j.task}\n\n${j.result}`,
+                }]);
+              }
+            }
+          }
+          firstJobsRef.current = false;  // don't replay history on first load
+        })
+        .catch(() => {});
     };
     tick();
     const h = setInterval(tick, 3000);
@@ -75,7 +97,7 @@ export default function App() {
 
   return (
     <div className="flex h-full w-full">
-      <DataDashboard stats={stats} status={status} onToggleVoice={toggleVoice} />
+      <DataDashboard stats={stats} status={status} jobs={jobs} onToggleVoice={toggleVoice} />
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* header: the central status ring */}

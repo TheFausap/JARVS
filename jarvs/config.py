@@ -92,6 +92,26 @@ METADREAM_ENABLED = _flag("JARVS_METADREAM", True)
 METADREAM_MIN_NEW = _int("JARVS_METADREAM_MIN_NEW", 16, floor=1)
 METADREAM_PROMOTE = _int("JARVS_METADREAM_PROMOTE", 3, floor=1)
 
+# Run an associative-consolidation ("dream") pass automatically every N completed
+# turns (0 disables; the manual /dream command always works).
+DREAM_EVERY = _int("JARVS_DREAM_EVERY", 12, floor=0)
+
+
+# --- live web access ---------------------------------------------------------- #
+
+# Master switch for any live web access, and whether background jobs may use it.
+ALLOW_WEB = _flag("JARVS_ALLOW_WEB", True)
+BACKGROUND_WEB = _flag("JARVS_BACKGROUND_WEB", True)
+
+
+# --- background jobs (autonomous deferred work) ------------------------------- #
+
+BACKGROUND_ENABLED = _flag("JARVS_BACKGROUND", True)
+BACKGROUND_MAX_PENDING = _int("JARVS_BACKGROUND_MAX_PENDING", 4, floor=1)
+BACKGROUND_RETRIES = _int("JARVS_BACKGROUND_RETRIES", 1, floor=0)
+BACKGROUND_RETRY_BACKOFF = _int("JARVS_BACKGROUND_RETRY_BACKOFF", 3, floor=0)
+BACKGROUND_CONTEXT_CHARS = _int("JARVS_BACKGROUND_CONTEXT_CHARS", 6000, floor=500)
+
 # --- voice -------------------------------------------------------------------- #
 
 TTS_BACKEND = _env("JARVS_TTS_BACKEND", "auto")  # auto | piper | say | off

@@ -1,5 +1,6 @@
 # --- Model / web access -------------------------------------------------------
 requests            # OpenAI-compatible chat calls to the llama.cpp endpoint
+ddgs                # DuckDuckGo search for background web research (optional)
 
 # --- External memory ----------------------------------------------------------
 # The vector store is a self-contained SQLite + NumPy collection (jarvs/vector_store.py),
