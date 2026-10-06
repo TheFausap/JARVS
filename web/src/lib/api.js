@@ -26,6 +26,12 @@ export async function getSystem() {
   return r.json();
 }
 
+export async function getRoutines() {
+  const r = await fetch("/api/routines");
+  if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
 export async function setVoice(enabled) {
   const r = await fetch("/api/voice", {
     method: "POST",

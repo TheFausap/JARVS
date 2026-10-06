@@ -123,6 +123,15 @@ BACKGROUND_RETRIES = _int("JARVS_BACKGROUND_RETRIES", 1, floor=0)
 BACKGROUND_RETRY_BACKOFF = _int("JARVS_BACKGROUND_RETRY_BACKOFF", 3, floor=0)
 BACKGROUND_CONTEXT_CHARS = _int("JARVS_BACKGROUND_CONTEXT_CHARS", 6000, floor=500)
 
+
+# --- routines (recurring scheduled tasks) ------------------------------------- #
+
+ROUTINES_ENABLED = _flag("JARVS_ROUTINES", True)
+# How often the scheduler wakes to check for due routines (seconds).
+ROUTINE_TICK = _int("JARVS_ROUTINE_TICK", 30, floor=5)
+# Default interval when a request says "repeating"/"recurring" without a period.
+ROUTINE_DEFAULT_INTERVAL = _int("JARVS_ROUTINE_DEFAULT_INTERVAL", 86400, floor=60)
+
 # --- voice -------------------------------------------------------------------- #
 
 TTS_BACKEND = _env("JARVS_TTS_BACKEND", "auto")  # auto | piper | say | off

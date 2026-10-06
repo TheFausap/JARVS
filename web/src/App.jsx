@@ -3,7 +3,9 @@ import StatusRing from "./components/StatusRing.jsx";
 import MessageStream from "./components/MessageStream.jsx";
 import DataDashboard from "./components/DataDashboard.jsx";
 import InputTerminal from "./components/InputTerminal.jsx";
-import { getStatus, getStats, getJobs, getSystem, setVoice, streamChat } from "./lib/api.js";
+import {
+  getStatus, getStats, getJobs, getSystem, getRoutines, setVoice, streamChat,
+} from "./lib/api.js";
 
 let _id = 0;
 const nextId = () => `m${_id++}`;
@@ -16,6 +18,7 @@ export default function App() {
   const [status, setStatus] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [system, setSystem] = useState(null);
+  const [routines, setRoutines] = useState([]);
   const busyRef = useRef(false);
   const seenDoneRef = useRef(new Set());
   const firstJobsRef = useRef(true);
@@ -53,6 +56,9 @@ export default function App() {
         .catch(() => {});
       getSystem()
         .then((d) => alive && d.enabled && setSystem(d))
+        .catch(() => {});
+      getRoutines()
+        .then((d) => alive && d.enabled && setRoutines(d.routines || []))
         .catch(() => {});
     };
     tick();
@@ -102,7 +108,7 @@ export default function App() {
   return (
     <div className="flex h-full w-full">
       <DataDashboard stats={stats} status={status} jobs={jobs} system={system}
-                     onToggleVoice={toggleVoice} />
+                     routines={routines} onToggleVoice={toggleVoice} />
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* header: the central status ring */}

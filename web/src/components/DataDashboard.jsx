@@ -1,8 +1,15 @@
 import { motion } from "framer-motion";
 import {
   Activity, Cpu, MemoryStick, Thermometer, Gauge, BrainCircuit, ListChecks,
-  Volume2, VolumeX, Radio, MapPin, Clock,
+  Volume2, VolumeX, Radio, MapPin, Clock, Repeat,
 } from "lucide-react";
+
+function nextIn(nextRun) {
+  const s = Math.max(0, Math.round(nextRun - Date.now() / 1000));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m`;
+  return `${s}s`;
+}
 
 const JOB_DOT = {
   queued: "#8a94a3", running: "#00d4ff", completed: "#3ddc97", failed: "#e5484d",
@@ -38,7 +45,7 @@ function SectionLabel({ children }) {
 
 const dash = (v) => (v === null || v === undefined ? "—" : v);
 
-export default function DataDashboard({ stats, status, jobs = [], system, onToggleVoice }) {
+export default function DataDashboard({ stats, status, jobs = [], system, routines = [], onToggleVoice }) {
   const online = status?.backend_ok;
   const voiceOn = stats?.voice_enabled ?? status?.voice_enabled;
   const jobCounts = stats?.jobs || {};
@@ -95,6 +102,32 @@ export default function DataDashboard({ stats, status, jobs = [], system, onTogg
           <Widget icon={Activity} label="TURNS" value={dash(stats?.turns)} />
         </div>
       </div>
+
+      {/* recurring routines */}
+      {routines.length > 0 && (
+        <div className="hairline rounded-md bg-[#0e0f12]/70 px-3 py-2.5">
+          <div className="flex items-center gap-2">
+            <Repeat size={12} color="#00d4ff" strokeWidth={1.5} />
+            <SectionLabel>ROUTINES</SectionLabel>
+          </div>
+          <div className="mt-2 flex flex-col gap-2">
+            {routines.map((r) => (
+              <div key={r.id} className="flex items-start gap-2">
+                <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full"
+                      style={{ background: r.enabled ? "#00d4ff" : "#4b5563" }} />
+                <div className="flex flex-col">
+                  <span className="font-mono text-[10px] leading-snug text-slate-300">
+                    {r.description}
+                  </span>
+                  <span className="font-mono text-[9px] text-slate-600">
+                    next in {nextIn(r.next_run)} · {r.runs} run{r.runs === 1 ? "" : "s"}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* recent background jobs */}
       <div className="hairline flex min-h-0 flex-1 flex-col rounded-md bg-[#0e0f12]/70 px-3 py-2.5">

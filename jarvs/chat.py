@@ -14,10 +14,12 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import uuid
 
 from . import client, config, system_sense
 from .background import BackgroundManager, should_auto_queue, extract_think_markers
+from .routines import RoutineScheduler, is_schedule_request, human_interval
 from .critic import Critic
 from .memory import Memory
 from .meta_dreaming import MetaDreamer
@@ -80,6 +82,16 @@ class JarvsSession:
                 store_path=os.path.join(str(config.DATA_DIR), "background_jobs.json"),
                 persona=self.system,
                 memory_fn=lambda t: self.memory.remember_fact(t, source="background"))
+
+        # Recurring routines: a scheduler that fires background jobs on a timer. Needs
+        # the background manager to run anything, so it is gated on it existing.
+        self.routines: RoutineScheduler | None = None
+        if config.ROUTINES_ENABLED and self.background is not None:
+            self.routines = RoutineScheduler(
+                background=self.background,
+                store_path=os.path.join(str(config.DATA_DIR), "routines.json"),
+                generate_fn=client.generate)
+            self.routines.start()
 
         # Turn counter driving the automatic dream (associative consolidation) cadence.
         self._turns_since_dream = 0
@@ -167,7 +179,13 @@ class JarvsSession:
         clean, tasks = extract_think_markers(reply)
         for task in tasks:
             self.background.queue(task)
-        if should_auto_queue(user_input):
+        # A recurring-schedule request creates routines (one LLM extraction pass, off
+        # the reply path) — not a single one-shot job. Otherwise, a plain "do this in
+        # the background" queues one job.
+        if self.routines is not None and is_schedule_request(user_input):
+            threading.Thread(target=self.routines.plan_and_create,
+                             args=(user_input,), daemon=True).start()
+        elif should_auto_queue(user_input):
             self.background.queue(user_input,
                                   context=self.memory.recall_block(user_input))
         return clean
@@ -260,6 +278,7 @@ _HELP = (
     "/metadream [run]     meta-dreaming focus areas; 'run' forces a distill pass\n"
     "/background <task>   queue a deferred task (runs off-conversation, may use web)\n"
     "/jobs                recent background jobs + their results\n"
+    "/routines [rm|off|on|run <id>]   recurring scheduled tasks\n"
     "/system              live host telemetry (CPU/GPU/mem/time/location)\n"
     "/status              backend + voice + memory status\n"
     "/reset               clear the conversation (memory persists)\n"
@@ -292,6 +311,8 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
             print(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
         if session.background is not None:
             print(f"  · {session.background.status()}")
+        if session.routines is not None:
+            print(f"  · {session.routines.status()}")
         if config.SYSTEM_SENSE:
             print(f"  · {system_sense.status()}")
         print(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
@@ -339,6 +360,28 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
                 star = "★" if a["pairs"] >= snap["promote_min_pairs"] else " "
                 print(f"    {star} {a['area']} (sessions={a['pairs']}, hits={a['hits']})"
                       + (f": {a['specific']}" if a["specific"] else ""))
+    elif cmd == "routines":
+        if session.routines is None:
+            print("  · routines are disabled (needs background work enabled)")
+        else:
+            sub, _, rid = arg.partition(" ")
+            sub, rid = sub.strip().lower(), rid.strip()
+            if sub in ("rm", "off", "on", "run") and rid:
+                if sub == "rm":
+                    ok = session.routines.remove(rid)
+                elif sub == "run":
+                    ok = session.routines.run_now(rid)
+                else:
+                    ok = session.routines.set_enabled(rid, sub == "on")
+                print(f"  · {'done' if ok else 'no routine '+rid}")
+            print(f"  · {session.routines.status()}")
+            now = time.time()
+            for r in session.routines.list():
+                when = max(0, int(float(r["next_run"]) - now))
+                state = "on " if r["enabled"] else "off"
+                print(f"    [{state}] {r['id']} · {r['description']} "
+                      f"({human_interval(r['interval_sec'])}, "
+                      f"next in {when // 3600}h{(when % 3600) // 60}m, runs={r['runs']})")
     elif cmd == "system":
         print(system_sense.summary_block(include_geo=True))
     elif cmd == "background":
@@ -369,7 +412,13 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
 
 
 def _flush_background(session: JarvsSession) -> None:
-    """Print any background job events that arrived since the last prompt."""
+    """Print any background-job / routine events that arrived since the last prompt."""
+    if session.routines is not None:
+        for ev in session.routines.drain_events():
+            if ev["kind"] == "created":
+                print(f"\n  ⟡ routine scheduled: {ev['description']}")
+            elif ev["kind"] == "fired":
+                print(f"\n  ⟡ routine fired: {ev['description']} (running now)")
     if session.background is None:
         return
     for ev in session.background.drain_events():
@@ -395,6 +444,8 @@ def main() -> None:
     print(f"  · {session.memory.status()}")
     if session.background is not None:
         print(f"  · {session.background.status()}")
+    if session.routines is not None:
+        print(f"  · {session.routines.status()}")
     while True:
         _flush_background(session)
         try:

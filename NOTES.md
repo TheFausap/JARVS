@@ -81,7 +81,14 @@ Background/agent-like layer added after the core build:
   every `JARVS_DREAM_EVERY` (default 12) turns, off the reply path.
 - Surfaced in the web UI: `/api/jobs`, a JOBS widget + background list, and completed
   results appear in the transcript. REPL: `/background`, `/jobs`, live job events.
-- Not ported: idle web-learning, meditation, self-authored routines.
+- **Recurring routines** (`jarvs/routines.py`): a scheduler daemon fires background
+  jobs on a timer. A plain-language scheduling request ("add daily searches about X
+  and Y") is turned into structured routines by one LLM extraction pass and actually
+  created — closing the earlier gap where the model *claimed* to schedule searches but
+  nothing was created. Intervals: hourly/daily/weekly/every-N. Web UI: `/api/routines`
+  + a ROUTINES panel. REPL: `/routines [rm|off|on|run <id>]`. v1 fires on an interval
+  from creation; clock-time anchoring ("08:00 digest") is a possible follow-up.
+- Not ported: idle web-learning, meditation.
 - **System awareness** (`jarvs/system_sense.py`): live host telemetry from the OS —
   CPU load/util, memory, NVIDIA GPU (util/VRAM/temp via nvidia-smi), disk, thermals,
   uptime, local clock/timezone, network (gateway/local IP), and IP-based geolocation

@@ -141,6 +141,11 @@ class JarvsHandler(BaseHTTPRequestHandler):
             return {"enabled": False, "jobs": []}
         return {"enabled": True, "jobs": self.session.background.recent(12)}
 
+    def _routines_payload(self) -> dict:
+        if self.session.routines is None:
+            return {"enabled": False, "routines": []}
+        return {"enabled": True, "routines": self.session.routines.list()}
+
     def _system_payload(self) -> dict:
         if not config.SYSTEM_SENSE:
             return {"enabled": False}
@@ -161,6 +166,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._send_json(self._jobs_payload())
         elif route == "/api/system":
             self._send_json(self._system_payload())
+        elif route == "/api/routines":
+            self._send_json(self._routines_payload())
         elif route.startswith("/api/"):
             self.send_error(404, "Not found")
         elif not os.path.isdir(_WEB_DIR):
