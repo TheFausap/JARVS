@@ -1,0 +1,82 @@
+import { motion } from "framer-motion";
+import {
+  Activity, Cpu, Database, Network, BrainCircuit, Volume2, VolumeX, Radio,
+} from "lucide-react";
+
+function Widget({ icon: Icon, label, value, unit, accent }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+      className="hairline rounded-md bg-[#0e0f12]/70 px-3 py-2.5"
+    >
+      <div className="flex items-center gap-2">
+        <Icon size={13} color={accent ? "#00d4ff" : "#8a94a3"} strokeWidth={1.5} />
+        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">
+          {label}
+        </span>
+      </div>
+      <div className="mt-1.5 flex items-baseline gap-1">
+        <span
+          className="font-mono text-lg"
+          style={{ color: accent ? "#00d4ff" : "#d7dbe3" }}
+        >
+          {value}
+        </span>
+        {unit && <span className="font-mono text-[10px] text-slate-600">{unit}</span>}
+      </div>
+    </motion.div>
+  );
+}
+
+export default function DataDashboard({ stats, status, onToggleVoice }) {
+  const online = status?.backend_ok;
+  const voiceOn = stats?.voice_enabled ?? status?.voice_enabled;
+
+  return (
+    <aside className="hairline flex w-72 shrink-0 flex-col gap-4 border-y-0 border-r-0 bg-[#0b0c0e]/60 p-5 backdrop-blur-sm">
+      {/* system heartbeat */}
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10px] tracking-[0.3em] text-slate-400">
+          SYSTEM
+        </span>
+        <span className="flex items-center gap-1.5 font-mono text-[10px]">
+          <Radio size={11} color={online ? "#00d4ff" : "#e5484d"} strokeWidth={2} />
+          <span style={{ color: online ? "#00d4ff" : "#e5484d" }}>
+            {online ? "ONLINE" : "OFFLINE"}
+          </span>
+        </span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2.5">
+        <Widget icon={Activity} label="LATENCY" value={stats?.latency_ms ?? "—"} unit="ms" accent />
+        <Widget icon={Cpu} label="TOKENS" value={stats?.last_tokens ?? "—"} />
+        <Widget icon={Database} label="EPISODIC" value={stats?.episodic ?? "—"} />
+        <Widget icon={Database} label="SEMANTIC" value={stats?.semantic ?? "—"} />
+        <Widget icon={Network} label="LINKS" value={stats?.links ?? "—"} />
+        <Widget icon={BrainCircuit} label="FOCUS" value={stats?.focus_promoted ?? "—"} accent />
+      </div>
+
+      <div className="hairline rounded-md bg-[#0e0f12]/70 px-3 py-2.5">
+        <span className="font-mono text-[9px] tracking-[0.22em] text-slate-500">TURNS</span>
+        <div className="mt-1 font-mono text-sm text-slate-300">{stats?.turns ?? 0}</div>
+      </div>
+
+      <div className="mt-auto flex flex-col gap-2">
+        <span className="font-mono text-[9px] tracking-[0.25em] text-slate-600 truncate">
+          {status?.model || "—"}
+        </span>
+        <button
+          onClick={() => onToggleVoice(!voiceOn)}
+          className={`hairline flex items-center justify-center gap-2 rounded-md py-2 font-mono text-[10px] tracking-[0.2em] transition-colors ${
+            voiceOn ? "text-ice glow-ice" : "text-slate-400 hover:text-slate-200"
+          }`}
+        >
+          {voiceOn ? <Volume2 size={13} /> : <VolumeX size={13} />}
+          {voiceOn ? "VOICE ON" : "VOICE OFF"}
+        </button>
+      </div>
+    </aside>
+  );
+}

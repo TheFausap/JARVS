@@ -13,6 +13,11 @@ data/
 voices/*.onnx
 voices/*.onnx.json
 
+# Web UI: dependencies and build output (regenerate with `npm run build` in web/)
+web/node_modules/
+web/dist/
+jarvs/web_dist/
+
 # Local overrides
 .env
 *.local

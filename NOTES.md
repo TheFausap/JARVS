@@ -21,7 +21,9 @@
 
 # REUSE MAP
 
-- **Web UI** ← JCN3690 `engram_web_poc.py` (stdlib http.server + markdown, LaTeX→MathML)
+- **Web UI** ← see WEB UI section (React/Vite SPA + Python SSE API). The old
+  `engram_web_poc.py` server-rendered approach was superseded by the spec below;
+  its backend techniques (HTTP serving, SSE streaming) carried over into `jarvs/server.py`.
 - **Voice output** ← JCN3690 `hal_voice.py` (Piper → `say` → off; swappable TTS)
 - **External memory** ← JCN3690 `vector_store.py` + `assoc_memory.py` (Chroma + sentence-transformers)
 - **Meta-dreaming** ← ENGRAM2 `meta_dreaming.py` (bounded self-referential critic-prompt refinement)
@@ -56,6 +58,13 @@ The UI should feel like a sophisticated, minimalist command center. It must be f
 - Elements entering the screen should fade and slide upwards slightly.
 - The status ring should animate its stroke-dasharray during processing states.
 - No abrupt pops; everything should feel fluid.
+
+**Implementation status (2026-10-06):** built in `web/` (Vite). Node installed at
+`~/.local/node` (no system node). Backend is `jarvs/server.py` (stdlib HTTP + SSE),
+reusing JarvsSession/client/memory/critic. All four components built
+(StatusRing, MessageStream, DataDashboard, InputTerminal). Token streaming, the
+state machine, dashboard polling, and voice toggle verified against the live model.
+Run: `cd web && npm run build` then `python -m jarvs.server` (see web/README.md).
 
 # OPEN QUESTIONS
 
