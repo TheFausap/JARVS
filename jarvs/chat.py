@@ -154,6 +154,39 @@ class JarvsSession:
                 pass
         return result
 
+    def stream_reply(self, user_input: str, learn: bool = True, speak: bool = False):
+        """Generator variant of :meth:`reply` for the web UI: yields visible content
+        deltas as they arrive, then records the full reply, persists it, and dispatches
+        the critique/meta-dreaming pass. On a backend error it yields nothing and the
+        caller can read :attr:`client.LAST_GENERATION_ERROR`."""
+        user_input = (user_input or "").strip()
+        if not user_input:
+            return
+        self.history.append({"role": "user", "content": user_input})
+        messages = self._fit_history()
+        full = [{"role": "system", "content": self.build_system(user_input)}] + messages
+        parts: list[str] = []
+        client.LAST_GENERATION_ERROR = ""
+        try:
+            for delta in client.stream_chat(full):
+                parts.append(delta)
+                yield delta
+        except Exception as e:  # noqa: BLE001
+            client.LAST_GENERATION_ERROR = f"{type(e).__name__}: {e}"
+            return
+        reply = client.strip_reasoning("".join(parts)).strip()
+        if not reply:
+            client.LAST_GENERATION_ERROR = (client.LAST_GENERATION_ERROR
+                                            or "empty reply")
+            return
+        self.history.append({"role": "assistant", "content": reply})
+        self.memory.remember_exchange(user_input, reply)
+        if speak and self.speak:
+            self.voice.speak(reply)
+        if learn and self.critic is not None:
+            threading.Thread(target=self.run_learning,
+                             args=(user_input, reply), daemon=True).start()
+
     def reply_and_speak(self, user_input: str, reveal=None) -> str:
         """Reply, then voice it. With a ``reveal`` callback the transcript is revealed
         in time with the audio (see JarvsVoice.speak_synced); otherwise it just speaks."""

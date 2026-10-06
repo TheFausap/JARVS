@@ -271,10 +271,72 @@ def count_tokens(text: str) -> int:
     return int(len(text) / 3.2) + 1
 
 
+def stream_chat(messages: list[dict], *, temperature: float | None = None,
+                reason: bool = False, timeout: int | None = None):
+    """Yield visible content deltas from the backend as they arrive (for the web UI).
+
+    Reasoning-chain deltas are dropped (the backend reports them separately as
+    ``reasoning_content``), so the stream is already clean of the scratchpad. Raises
+    on a connection error — the caller decides how to surface it."""
+    payload = {
+        "model": resolve_served_model(),
+        "messages": messages,
+        "temperature": config.TEMPERATURE if temperature is None else temperature,
+        "stream": True,
+        "max_tokens": int(config.GEN_RESERVE),
+        "stream_options": {"include_usage": True},
+    }
+    if not reason or not config.THINKING_ENABLED:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    url = f"{config.BASE_URL.rstrip('/')}/chat/completions"
+    timeout = config.REPLY_TIMEOUT if timeout is None else timeout
+    with requests.post(url, json=payload, headers=_headers(), timeout=timeout,
+                       stream=True) as response:
+        response.raise_for_status()
+        for raw in response.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[len("data:"):].strip()
+            if not line or line == "[DONE]":
+                if line == "[DONE]":
+                    break
+                continue
+            try:
+                chunk = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0] or {}).get("delta") or {}
+            if delta.get("content"):
+                yield delta["content"]
+
+
+_HEALTH_CACHE: tuple[float, bool, str] = (0.0, False, "")
+_HEALTH_TTL = 4.0  # seconds; the dashboard polls /api/stats every ~3s
+
+
 def health() -> tuple[bool, str]:
-    """Best-effort reachability probe for /status and startup. Returns (ok, detail)."""
+    """Reachability probe for /status and the dashboard. Actually pings the backend
+    (a bare model-list GET) rather than trusting the configured id, and caches the
+    result briefly so repeated polls don't each block. Returns (ok, detail)."""
+    global _HEALTH_CACHE
+    import time
+    now = time.time()
+    ts, ok, detail = _HEALTH_CACHE
+    if now - ts < _HEALTH_TTL and ts:
+        return ok, detail
     try:
-        model = resolve_served_model()
-        return True, f"backend reachable · serving {model}"
+        r = requests.get(f"{config.BASE_URL.rstrip('/')}/models",
+                         headers=_headers(), timeout=2)
+        r.raise_for_status()
+        model = config.MODEL if config.MODEL and config.MODEL != "auto" \
+            else resolve_served_model()
+        ok, detail = True, f"backend reachable · serving {model}"
     except Exception as e:  # noqa: BLE001
-        return False, f"backend unreachable at {config.BASE_URL}: {e}"
+        ok, detail = False, f"backend unreachable at {config.BASE_URL}: {e}"
+    _HEALTH_CACHE = (now, ok, detail)
+    return ok, detail
