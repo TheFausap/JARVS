@@ -121,6 +121,9 @@ def _chat_completion_stream(url: str, payload: dict, timeout: int) -> dict:
     with requests.post(url, json=payload, headers=_headers(), timeout=timeout,
                        stream=True) as response:
         response.raise_for_status()
+        # requests defaults a charset-less text/event-stream to ISO-8859-1, which
+        # mojibakes UTF-8 (a curly ’ becomes "â€™"). Force UTF-8 before decoding.
+        response.encoding = "utf-8"
         for raw in response.iter_lines(decode_unicode=True):
             if not raw:
                 continue
@@ -293,6 +296,9 @@ def stream_chat(messages: list[dict], *, temperature: float | None = None,
     with requests.post(url, json=payload, headers=_headers(), timeout=timeout,
                        stream=True) as response:
         response.raise_for_status()
+        # requests defaults a charset-less text/event-stream to ISO-8859-1, which
+        # mojibakes UTF-8 (a curly ’ becomes "â€™"). Force UTF-8 before decoding.
+        response.encoding = "utf-8"
         for raw in response.iter_lines(decode_unicode=True):
             if not raw:
                 continue
