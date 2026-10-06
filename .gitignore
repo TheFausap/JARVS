@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data / memory stores
+data/
+*.sqlite3
+*.jsonl
+
+# Voice models (large; download separately)
+voices/*.onnx
+voices/*.onnx.json
+
+# Local overrides
+.env
+*.local

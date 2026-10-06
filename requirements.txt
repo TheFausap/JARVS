@@ -1,0 +1,20 @@
+# --- Model / web access -------------------------------------------------------
+requests            # OpenAI-compatible chat calls to the llama.cpp endpoint
+
+# --- External memory ----------------------------------------------------------
+# The vector store is a self-contained SQLite + NumPy collection (jarvs/vector_store.py),
+# so no chromadb dependency. sentence-transformers supplies the embeddings.
+sentence-transformers
+numpy
+
+# --- Voice output -------------------------------------------------------------
+# Local neural TTS for JARVS's voice. Without piper-tts (or a downloaded .onnx
+# voice model) the voice layer falls back to the macOS `say` command, which needs
+# no packages. See NOTES.md / voices/ for the model download.
+piper-tts
+
+# --- Rendering (web UI) -------------------------------------------------------
+Markdown
+Pygments
+latex2mathml
+pylatexenc
