@@ -135,15 +135,44 @@ Background/agent-like layer added after the core build:
   can also defer a build itself with a `[[CODE: topic]]` marker, mirroring
   `[[THINK:]]`. Builds run on their own worker thread, off the reply path, like
   background jobs. REPL: `/code`, `/projects [rm|open|tree <id>]`.
+- **The duet — Qwen and Claude coding together** (2026-10-12): when the Claude bridge is
+  ON, a foundry build stops being Qwen alone and becomes a bounded dialogue. Qwen3-Coder-
+  Next does the bulk of the work (local, unlimited tokens); Claude is consulted only
+  where a second opinion changes the outcome, read-only, through the bridge's own gates
+  and token ledger:
+  1. **design review** — Claude reads the plan *before a file is written* (the cheapest
+     possible moment to hear "this won't work"); Qwen then revises the design in one
+     call (`JARVS_CODER_COLLAB_PLAN`, on by default).
+  2. **failure diagnosis** — when the local repairs can't fix it, Claude reads the
+     actual project directory and the failing output, names the root cause, and that
+     diagnosis becomes Qwen's repair brief.
+  3. **final critique** — one review of the finished, passing project; acted on only if
+     it names something concrete, and **rolled back if the change breaks the checks** —
+     the verified files are restored, not just the verdict.
+  `JARVS_CODER_COLLAB_ROUNDS` (default 2) caps Claude consultations per build, so no
+  single project can quietly drain a subscription; `JARVS_CODER_COLLAB=0` or bridge off
+  reverts to a solo Qwen build. Each consultation is a new `ClaudeBridge.consult()`
+  (same pre-flight gate, budget gate and ledger as a delegation, but never offered
+  write access and scoped to the project directory). The whole dialogue is recorded on
+  the project (`collab`), rendered into `JARVS_REPORT.md`, summarised in the result
+  line ("· 2 Claude review(s)"), and shown in the REPL, the transcript and the FORGE
+  panel.
 - **Two coding paths, one router** (`_route_coding` in `chat.py`): the foundry and the
   Claude Code bridge both answer "write me some code" and each has its own detector, so
   importing both would have collided on the name. `claude_bridge.is_code_request` is
   imported as `is_claude_request` and stays the *narrower* test (an explicit 'claude
   code', Claude + a coding word, or a tight code-verb→code-noun phrase); the foundry's
-  detector is the broader 'build me a thing' test. Routing: schedules → Claude bridge
-  (when enabled) → foundry → background job. So an explicit Claude delegation keeps
-  going to Claude, and everything else that reads as a build request goes to
-  Qwen3-Coder-Next. The foundry is on by default; the bridge is opt-in.
+  detector is the broader 'build me a thing' test. Routing:
+  1. an **explicit Claude delegation** (the user named Claude) → the bridge alone, since
+     that is about *their* tree, not a new project;
+  2. a **build request** → the foundry, which is the duet when the bridge is on;
+  3. **any other code task** with the bridge on (work on an existing file/module) → the
+     bridge alone.
+  The foundry's detector also refuses work on code that already exists — a named source
+  file (`parser.py`), a definite reference ("the parser", "our client"), or a leading
+  maintenance verb ("refactor the module") — because that is the bridge's job. If the
+  user names Claude while the bridge is off, nothing is claimed: no silent substitution
+  with a different model. The foundry is on by default; the bridge is opt-in.
 - **Web UI**: `/api/code` (GET projects / POST a topic), a FORGE widget + project list
   in the sidebar, and finished builds surface in the transcript as `JARVS · FORGE`.
   The system head carries a `[AUTONOMOUS CODING]` block so the model says "on it"

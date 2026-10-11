@@ -125,18 +125,6 @@ class JarvsSession:
                 persona=self.system,
                 memory_fn=lambda t: self.memory.remember_fact(t, source="background"))
 
-        # Autonomous coding: a topic in, a working project out on disk. Runs on the
-        # Qwen3-Coder-Next backend (jarvs/coder.py) with its own worker thread, so a
-        # build never blocks the conversation.
-        self.coder: CodeFoundry | None = None
-        self.coder_backend: CoderBackend | None = None
-        if config.CODER_ENABLED:
-            self.coder_backend = CoderBackend()
-            self.coder = CodeFoundry(
-                generate_fn=self.coder_backend.complete,
-                store_path=os.path.join(str(config.DATA_DIR), "code_projects.json"),
-                memory_fn=lambda t: self.memory.remember_fact(t, source="coder"))
-
         # Recurring routines: a scheduler that fires background jobs on a timer. Needs
         # the background manager to run anything, so it is gated on it existing.
         self.routines: RoutineScheduler | None = None
@@ -160,6 +148,22 @@ class JarvsSession:
                 # Feed each outcome back as a durable fact so JARVS learns from its own
                 # missteps and from Claude's observations about the codebase.
                 memory_fn=lambda t: self.memory.remember_fact(t, source="claude_bridge"))
+
+        # Autonomous coding: a topic in, a working project out on disk. Runs on the
+        # Qwen3-Coder-Next backend (jarvs/coder.py) with its own worker thread, so a
+        # build never blocks the conversation. Built after the bridge on purpose: when
+        # the bridge is on, it becomes the foundry's peer reviewer and the two models
+        # work the build together (see _claude_review).
+        self.coder: CodeFoundry | None = None
+        self.coder_backend: CoderBackend | None = None
+        if config.CODER_ENABLED:
+            self.coder_backend = CoderBackend()
+            self.coder = CodeFoundry(
+                generate_fn=self.coder_backend.complete,
+                review_fn=(self._claude_review if self.claude_bridge is not None
+                           else None),
+                store_path=os.path.join(str(config.DATA_DIR), "code_projects.json"),
+                memory_fn=lambda t: self.memory.remember_fact(t, source="coder"))
 
         # Standing rules: durable user-set directives injected every turn (and the
         # actionable web-verify flag the reply path consults).
@@ -196,6 +200,23 @@ class JarvsSession:
         if self.coder_backend is None:
             return False, "coder: disabled (JARVS_CODER=0)"
         return self.coder_backend.health()
+
+    def _claude_review(self, brief: str, cwd: str | None = None) -> str:
+        """The foundry's hotline to Claude: one read-only consultation.
+
+        Used at the three moments where a second opinion changes the outcome — the
+        design before a file is written, a failure the local repairs could not fix, and
+        a final critique of the finished project. Everything goes through the bridge's
+        own gates and token ledger, so the duet is governed exactly like a delegation.
+        Returns '' when Claude declines or the budget is spent, and the build carries
+        on as a solo run.
+        """
+        if self.claude_bridge is None or not config.CODER_COLLAB:
+            return ""
+        result = self.claude_bridge.consult(brief, cwd=cwd)
+        if result.get("status") != "ok":
+            return ""
+        return (result.get("text") or "").strip()
 
     def build(self, topic: str) -> dict | None:
         """Queue an autonomous build. Returns the project dict, or None if refused."""
@@ -380,32 +401,46 @@ class JarvsSession:
                                   context=self.memory.recall_block(user_input))
         return clean
 
+    def _delegate_claude(self, user_input: str) -> bool:
+        """Hand the whole task to Claude, governed by the bridge, off the reply path."""
+        threading.Thread(
+            target=self.claude_bridge.request_code,
+            args=(user_input, self.memory.recall_block(user_input)),
+            daemon=True).start()
+        return True
+
     def _route_coding(self, user_input: str) -> bool:
         """Send a coding request to its executor. Returns True if one claimed it.
 
-        Two coding paths coexist, with deliberately different detectors:
-        an explicit, opt-in Claude Code delegation (``is_claude_request``: a 'claude
-        code' mention, or Claude + a coding word) goes to the governed bridge; anything
-        else that reads as 'go build me this' (``is_code_request``: build verb + software
-        object) goes to the local foundry, which writes and verifies the project itself.
+        Three cases, in order:
+
+        1. **An explicit Claude delegation** — the user named Claude and asked for a
+           code task (``is_claude_request``: 'claude code', or Claude + a coding word).
+           That is about *their* tree, so the bridge handles it alone, as it always has.
+        2. **A build request** (``is_code_request``: build verb + software object, and
+           not about code that already exists) goes to the foundry. With the bridge on
+           this is *the duet*: Qwen3-Coder-Next writes the project and Claude reviews
+           the design, diagnoses stubborn failures and critiques the result. With the
+           bridge off, Qwen builds alone.
+        3. **Any other code task** with the bridge on is Claude's alone — work on an
+           existing file or module, which the foundry does not do.
         """
-        if self.claude_bridge is not None and is_claude_request(user_input):
-            # Delegate coding to Claude off the reply path; the dialogue + token
-            # governance surface as bridge events (drained before the next prompt).
-            threading.Thread(
-                target=self.claude_bridge.request_code,
-                args=(user_input, self.memory.recall_block(user_input)),
-                daemon=True).start()
-            return True
-        if _NAMES_CLAUDE_RE.search(user_input) and self.claude_bridge is None:
+        named_claude = bool(_NAMES_CLAUDE_RE.search(user_input))
+        if self.claude_bridge is not None and named_claude \
+                and is_claude_request(user_input):
+            return self._delegate_claude(user_input)
+        if named_claude and self.claude_bridge is None:
             # The user named Claude but the bridge is off — don't quietly build it with
             # a different model. Leave it to the reply path, which can say so.
             return False
+        # The duet (or a solo Qwen build when there is no bridge).
         if self.coder is not None and is_code_request(user_input):
             # A topic in, a working project on disk out. Runs on the foundry's own
             # worker thread, so the turn is never blocked by a build.
             self.build(user_input)
             return True
+        if self.claude_bridge is not None and is_claude_request(user_input):
+            return self._delegate_claude(user_input)
         return False
 
     def _remember_from_request(self, user_input: str, history: list[dict]) -> None:
@@ -777,6 +812,21 @@ def _project_result_line(project_id: str, session: JarvsSession) -> str:
     return (f"{p.get('result') or ''} · {verdict}")
 
 
+def _project_duet_line(project_id: str, session: JarvsSession) -> list[str]:
+    """One line per peer turn, so a build reads as a collaboration, not a solo run."""
+    p = session.coder.get(project_id) if session.coder else None
+    if not p:
+        return []
+    out = []
+    for turn in p.get("collab") or []:
+        if turn.get("role") != "peer":
+            continue
+        first = (turn.get("text") or "").strip().splitlines()
+        out.append(f"⟡ Claude · {turn.get('kind', 'review')}: "
+                   f"{(first[0][:110] if first else '').strip()}")
+    return out
+
+
 def _project_tree(path: str, prefix: str = "        ") -> str:
     """A short indented file listing for a built project (depth-capped, sorted)."""
     if not path or not os.path.isdir(path):
@@ -806,6 +856,8 @@ def _flush_background(session: JarvsSession) -> None:
             elif ev["kind"] == "completed":
                 print(f"\n  ⟡ build {ev['id']} complete — {ev['name']}")
                 print(f"    {_project_result_line(ev['id'], session)}")
+                for turn in _project_duet_line(ev["id"], session):
+                    print(f"    {turn}")
             elif ev["kind"] == "failed":
                 p = session.coder.get(ev["id"]) or {}
                 print(f"\n  ⟡ build {ev['id']} failed: {ev['topic'][:60]}")

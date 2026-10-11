@@ -66,6 +66,20 @@ _QUESTION = re.compile(
     r"^\s*(?:what|how|why|when|where|who|which|is|are|was|were|do|does|did|"
     r"can|could|would|should|explain|tell me)\b.*\?\s*$", re.I | re.S)
 
+# The foundry builds NEW projects from a topic. Work on code that already exists is the
+# Claude bridge's job (it runs in the user's tree), so these disqualify a request here:
+# a named source file, a definite reference to an existing artifact ("the parser", "our
+# client"), or a maintenance verb leading the sentence ("refactor the module").
+_CODE_FILE_RE = re.compile(
+    r"\b[\w./-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|c|cpp|h|sh)\b", re.I)
+_EXISTING_REF_RE = re.compile(
+    r"\b(?:the|this|that|our|my|existing|current)\s+(?:[\w-]+\s+){0,1}"
+    r"(?:module|file|class|function|method|repo|repository|codebase|project|script|"
+    r"parser|server|client|api|endpoint|test|tests|code)\b", re.I)
+_MAINTENANCE_LEAD_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:fix|refactor|debug|patch|optimi[sz]e|update|change|"
+    r"rename|move|remove|clean\s+up|improve|rewrite|migrate|add)\b", re.I)
+
 
 def is_code_request(text: str) -> bool:
     """High-precision test for 'go build this for me'.
@@ -76,6 +90,9 @@ def is_code_request(text: str) -> bool:
     t = (text or "").strip()
     if len(t) < 8 or _QUESTION.match(t):
         return False
+    if (_CODE_FILE_RE.search(t) or _EXISTING_REF_RE.search(t)
+            or _MAINTENANCE_LEAD_RE.match(t)):
+        return False           # about existing code — the bridge's job, not ours
     return bool(_CODE_PHRASE.search(t)
                 or (_BUILD_VERB.search(t) and _BUILD_OBJECT.search(t)))
 
@@ -356,6 +373,64 @@ Reply with EXACTLY this shape and nothing else:
 <the complete corrected file>
 ```"""
 
+_REVISE_SYSTEM = """You are a senior software engineer revising your build plan after a
+peer review.
+Another engineer has read your design and raised points. Adopt the ones that make the
+project better and keep the design small, complete and runnable.
+
+Output ONLY the revised JSON object with the same schema (no prose, no fences):
+{{"name": str, "slug": str, "language": str, "entry": str, "summary": str,
+ "test_command": str, "files": [{{"path": str, "purpose": str}}]}}
+
+Keep at most {max_files} files. If you disagree with a point, you may ignore it, but
+the result must still be a complete project."""
+
+_REVISE_USER = """TOPIC:
+{topic}
+
+CURRENT DESIGN:
+{plan}
+
+PEER REVIEW:
+{advice}
+
+Reply with the revised JSON object only."""
+
+_DUET_BRIEF = {
+    "plan": """Review this design for a small, self-contained software project BEFORE any
+code is written. The project must run as specified and be complete.
+
+TOPIC: {topic}
+
+DESIGN:
+{plan}
+
+Reply with concrete, actionable revisions — at most 10 lines. If the design is sound,
+reply with a single line: LGTM.""",
+    "failure": """A local coding model wrote the project below but its checks still fail after
+{rounds} repair attempt(s). Read the code in this directory and the failing output, then
+diagnose the ROOT CAUSE.
+
+PROJECT: {name} — {summary}
+FILES: {files}
+
+FAILING CHECK OUTPUT:
+```
+{error}
+```
+
+Reply with the root cause and the concrete change that fixes it — at most 15 lines,
+naming the specific file(s). Do not edit anything.""",
+    "critique": """Review the finished project below. It builds and its checks pass. Look for
+correctness gaps, edge cases it gets wrong, and anything that will break in normal use.
+
+PROJECT: {name} — {summary}
+FILES: {files}
+
+Reply with the defects worth fixing — at most 10 lines, naming the specific file(s). If
+you find nothing worth changing, reply with a single line: LGTM.""",
+}
+
 _REPAIR_USER = """PROJECT: {name} — {summary}
 FILE: {path}
 Purpose: {purpose}
@@ -372,7 +447,8 @@ FAILING CHECK OUTPUT:
 
 Rewrite `{path}` so the project builds and the checks pass. If the failure is caused by
 another file's interface, adapt THIS file to that interface rather than renaming things
-you cannot see."""
+you cannot see.
+{advice}"""
 
 
 # --- the foundry -------------------------------------------------------------- #
@@ -390,10 +466,15 @@ class CodeFoundry:
 
     def __init__(self, *, store_path: str,
                  generate_fn: Callable[[str, str], str] | None = None,
+                 review_fn: Callable[[str, str | None], str] | None = None,
                  memory_fn: Callable[[str], None] | None = None,
                  on_event: Callable[[str, dict], None] | None = None,
                  projects_dir: str | None = None):
         self._generate = generate_fn or CoderBackend().complete
+        # The duet: one bounded, read-only consultation with the peer model (Claude).
+        # ``review_fn(brief, cwd) -> str``; '' means it declined or is unavailable, and
+        # the build simply continues as a solo run.
+        self._review = review_fn
         self._memory_fn = memory_fn
         self._on_event = on_event
         self._store_path = store_path
@@ -402,6 +483,9 @@ class CodeFoundry:
         self._thread: threading.Thread | None = None
         self.projects: list[dict] = self._load()
         self.events: list[dict] = []
+        # Consultations spent per build (project id -> count), capped by
+        # CODER_COLLAB_ROUNDS so one build can't drain a subscription on its own.
+        self._claude_used: dict[str, int] = {}
 
     # -- persistence ---------------------------------------------------------- #
 
@@ -507,9 +591,100 @@ class CodeFoundry:
 
     # -- the build pipeline --------------------------------------------------- #
 
+    # -- the duet (peer review inside the build) ------------------------------ #
+
+    @property
+    def duet_enabled(self) -> bool:
+        """True when a peer model is available AND collaboration is switched on."""
+        return self._review is not None and config.CODER_COLLAB
+
+    def _consult(self, pid: str, kind: str, brief: str, cwd: str | None = None) -> str:
+        """One bounded consultation with the peer model. '' when it declines.
+
+        ``CODER_COLLAB_ROUNDS`` caps how many of these ONE build may spend, so a
+        pathological project cannot quietly drain a subscription.
+        """
+        if self._review is None or not config.CODER_COLLAB:
+            return ""
+        used = self._claude_used.get(pid, 0)
+        if used >= config.CODER_COLLAB_ROUNDS:
+            return ""
+        self._claude_used[pid] = used + 1
+        self._update(pid, progress=f"claude {kind}")
+        try:
+            reply = (self._review(brief, cwd) or "").strip()
+        except Exception:  # noqa: BLE001 — a declined review must not fail the build
+            reply = ""
+        if not reply:
+            self._claude_used[pid] = used          # a declined call costs nothing
+            return ""
+        self._note(pid, "peer", kind, reply)
+        return reply
+
+    @staticmethod
+    def _is_lgtm(text: str) -> bool:
+        """Did the reviewer effectively say 'nothing to change'?"""
+        t = (text or "").strip().lower()
+        if not t:
+            return True
+        if t.startswith("lgtm") or t.startswith("verdict: lgtm"):
+            return True
+        return len(t) < 12 and "lgtm" in t
+
+    def _note(self, pid: str, role: str, kind: str, text: str) -> None:
+        """Append one turn of the Qwen↔Claude dialogue to the project record."""
+        with self._lock:
+            p = next((x for x in self.projects if x.get("id") == pid), None)
+            if p is None:
+                return
+            notes = list(p.get("collab") or [])
+            notes.append({"role": role, "kind": kind, "text": text[:4000],
+                          "t": time.time()})
+            p["collab"] = notes[-12:]
+            self._save_locked()
+
+    def _revise_plan(self, pid: str, plan: dict, topic: str, advice: str) -> dict:
+        """Hand the peer's review of the design back to the coder and take the revision."""
+        self._update(pid, progress="revising the design")
+        raw = self._generate(
+            _REVISE_SYSTEM.format(max_files=config.CODER_MAX_FILES),
+            _REVISE_USER.format(topic=topic,
+                                plan=json.dumps(plan, indent=2)[:6000],
+                                advice=advice[:4000]))
+        revised = _json_object(raw)
+        if not revised or not isinstance(revised.get("files"), list):
+            return plan                     # an unusable revision keeps the original
+        files = []
+        for f in revised["files"][:config.CODER_MAX_FILES]:
+            if not isinstance(f, dict):
+                continue
+            path = _clean_rel_path(str(f.get("path", "")))
+            if path:
+                files.append({"path": path, "purpose": str(f.get("purpose", ""))[:300]})
+        if not files:
+            return plan
+        revised["files"] = files
+        revised["entry"] = _clean_rel_path(str(revised.get("entry") or "")) or files[0]["path"]
+        revised["name"] = str(revised.get("name") or plan.get("name") or topic)[:80]
+        revised["summary"] = str(revised.get("summary") or plan.get("summary") or "")[:600]
+        revised["test_command"] = str(revised.get("test_command")
+                                      or plan.get("test_command") or "")[:200]
+        revised["language"] = str(revised.get("language")
+                                  or plan.get("language") or "other").lower()
+        self._note(pid, "coder", "revised design",
+                   json.dumps({k: revised[k] for k in
+                               ("name", "language", "entry", "files")}, indent=2))
+        return revised
+
     def build(self, project: dict) -> dict:
-        """Plan → write → verify → repair. Returns the finished project dict."""
+        """Plan → write → verify → repair. Returns the finished project dict.
+
+        With a peer model attached (the bridge on) the pipeline becomes a dialogue:
+        Claude reviews the design before a file is written, diagnoses any failure the
+        local repairs could not fix, and critiques the result once it passes.
+        """
         pid = project["id"]
+        self._claude_used[pid] = 0
         try:
             plan = self._plan(project)
             if plan is None:
@@ -524,6 +699,19 @@ class CodeFoundry:
                          path=root, language=plan.get("language") or "other",
                          summary=plan.get("summary") or "", plan=plan,
                          progress="planning done")
+
+            # DUET 1 — the design is reviewed before anything is written: catching a
+            # bad plan here costs one review instead of a whole project.
+            if self.duet_enabled and config.CODER_COLLAB_PLAN:
+                brief = _DUET_BRIEF["plan"].format(
+                    topic=project["topic"], plan=self._design_block(plan))
+                advice = self._consult(pid, "design review", brief)
+                if advice and not self._is_lgtm(advice):
+                    plan = self._revise_plan(pid, plan, project["topic"], advice)
+                    self._update(pid, plan=plan,
+                                 name=plan.get("name") or project["topic"],
+                                 language=plan.get("language") or "other",
+                                 summary=plan.get("summary") or "")
 
             written = self._write_files(pid, plan, root)
             if not written:
@@ -545,12 +733,75 @@ class CodeFoundry:
                 checks = self._verify(plan, root)
                 self._update(pid, checks=checks, verified=checks.get("ok", False))
 
+            # DUET 2 — still failing: let the peer read the code and diagnose it, then
+            # hand that diagnosis to the coder as the repair brief. This is the case
+            # where a second model actually changes the outcome.
+            checks, rounds = self._collaborate(pid, plan, root, checks, rounds)
+
             self._write_report(pid, plan, root, checks, rounds)
             self._tidy(root)                   # no __pycache__/.pytest_cache in the result
             self._update(pid, repairs=rounds, progress="done")
             return self._finish(pid)
         except Exception as e:  # noqa: BLE001 — one bad build must not kill the worker
             return self._finish(pid, error=f"{type(e).__name__}: {e}")
+
+    def _collaborate(self, pid: str, plan: dict, root: str, checks: dict,
+                     rounds: int) -> tuple[dict, int]:
+        """The peer's remaining interventions: diagnose a failure, then critique a pass.
+
+        Returns the (possibly updated) checks and repair count. Every branch is bounded
+        by ``CODER_COLLAB_ROUNDS`` and every repair it triggers is a normal repair round,
+        so a build with a peer attached can never loop longer than one without it.
+        """
+        if not self.duet_enabled:
+            return checks, rounds
+
+        # 1. Still failing after the local repairs → ask for a diagnosis, then repair
+        #    with it as the brief.
+        if not checks.get("ok") and any(c.get("runnable")
+                                        for c in checks.get("checks", [])):
+            brief = _DUET_BRIEF["failure"].format(
+                name=plan.get("name", ""), summary=plan.get("summary", ""),
+                rounds=rounds, files=self._design_block(plan),
+                error=checks.get("log", "")[:3000])
+            advice = self._consult(pid, "failure diagnosis", brief, cwd=root)
+            if advice:
+                rounds += 1
+                self._update(pid, repairs=rounds,
+                             progress=f"repairing {rounds} (peer diagnosis)")
+                if self._repair(pid, plan, root, checks, advice=advice):
+                    checks = self._verify(plan, root)
+                    self._update(pid, checks=checks,
+                                 verified=checks.get("ok", False))
+
+        # 2. Passing → one critique of the finished project; act on it only if the peer
+        #    named something concrete.
+        if checks.get("ok"):
+            brief = _DUET_BRIEF["critique"].format(
+                name=plan.get("name", ""), summary=plan.get("summary", ""),
+                files=self._design_block(plan))
+            advice = self._consult(pid, "final critique", brief, cwd=root)
+            if advice and not self._is_lgtm(advice):
+                rounds += 1
+                self._update(pid, repairs=rounds,
+                             progress=f"repairing {rounds} (peer critique)")
+                snapshot = self._snapshot(root, plan)
+                if self._repair(pid, plan, root, checks, advice=advice):
+                    after = self._verify(plan, root)
+                    if after.get("ok"):
+                        checks = after
+                        self._update(pid, checks=checks, verified=True)
+                    else:
+                        # A critique is advice, not gospel. Undo the files (not just
+                        # the verdict) — a passing build we cannot reproduce on disk is
+                        # a lie, so roll the code back and keep the build we verified.
+                        self._restore(pid, root, snapshot)
+                        self._verify(plan, root)
+                        self._update(pid, progress="peer critique reverted")
+                        self._note(pid, "coder", "critique reverted",
+                                   "the peer's suggested change broke the checks and "
+                                   "was discarded; the verified version was restored")
+        return checks, rounds
 
     def _plan(self, project: dict) -> dict | None:
         self._update(project["id"], progress="planning")
@@ -627,6 +878,36 @@ class CodeFoundry:
                 body = "(unreadable)"
             parts.append(f"\n--- {w['path']} ---\n{body}")
         return "\n".join(parts) + "\n\n"
+
+    @staticmethod
+    def _snapshot(root: str, plan: dict) -> dict[str, str]:
+        """Every file's current contents, so a change can be undone afterwards."""
+        snap: dict[str, str] = {}
+        for spec in plan.get("files", []):
+            full = safe_join(root, spec["path"])
+            if not full or not os.path.isfile(full):
+                continue
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    snap[spec["path"]] = fh.read()
+            except OSError:
+                continue
+        return snap
+
+    def _restore(self, pid: str, root: str, snap: dict[str, str]) -> None:
+        """Put the files back after a peer's suggestion broke the build."""
+        for rel, content in snap.items():
+            self._write(root, rel, content)
+        with self._lock:
+            p = next((x for x in self.projects if x.get("id") == pid), None)
+            if p is None:
+                return
+            files = [dict(f) for f in (p.get("files") or [])]
+            for f in files:
+                if f.get("path") in snap:
+                    f["chars"] = len(snap[f["path"]])
+            p["files"] = files
+            self._save_locked()
 
     @staticmethod
     def _write(root: str, rel: str, content: str) -> bool:
@@ -724,8 +1005,14 @@ class CodeFoundry:
         return {"name": "tests (" + " ".join(os.path.basename(a) for a in argv) + ")",
                 **res}
 
-    def _repair(self, pid: str, plan: dict, root: str, checks: dict) -> list[str]:
-        """Feed the failure back to the model and rewrite the implicated files."""
+    def _repair(self, pid: str, plan: dict, root: str, checks: dict,
+                advice: str = "") -> list[str]:
+        """Feed the failure back to the model and rewrite the implicated files.
+
+        ``advice`` is an optional second opinion (the peer model's diagnosis of the
+        failure, or its critique of the finished project) appended to the brief — the
+        coder still writes the code, the peer only steers.
+        """
         error = checks.get("log", "")[:4000]
         targets = self._blame(plan, root, error)
         fixed: list[str] = []
@@ -740,9 +1027,16 @@ class CodeFoundry:
                 continue
             purpose = next((f["purpose"] for f in plan["files"]
                             if f["path"] == rel), "")
+            advice_block = ""
+            if advice:
+                advice_block = ("\nPEER REVIEW (a second model read the code and "
+                                "the failure above; weigh it heavily, but only "
+                                "make changes that are correct):\n"
+                                + advice.strip()[:3000])
             user = _REPAIR_USER.format(
                 name=plan["name"], summary=plan["summary"], path=rel,
-                purpose=purpose, lang=self._lang(plan), content=content, error=error)
+                purpose=purpose, lang=self._lang(plan), content=content,
+                error=error, advice=advice_block)
             raw = self._generate(_REPAIR_SYSTEM.format(path=rel, lang=self._lang(plan)),
                                  user)
             if CoderBackend.failed(raw):
@@ -824,8 +1118,17 @@ class CodeFoundry:
                          + ("" if c.get("ok") else f"\n\n```\n{c.get('output','')}\n```"))
         if not checks.get("checks"):
             lines.append(f"- {checks.get('log') or 'no checks could be run'}")
-        lines += ["", "_Built autonomously by JARVS (coder: "
-                  f"{config.CODER_MODEL})._", ""]
+        collab = project.get("collab") or []
+        if collab:
+            lines += ["", "## Collaboration (Qwen \u2194 Claude)", ""]
+            for turn in collab:
+                who = ("Claude (review)" if turn.get("role") == "peer"
+                       else config.CODER_MODEL + " (coder)")
+                lines += [f"### {who} \u2014 {turn.get('kind', '')}", "",
+                          (turn.get("text") or "").strip()[:2500], ""]
+        duo = " with review from Claude" if collab else ""
+        lines += ["", "_Built autonomously by JARVS \u2014 coder: "
+                  f"{config.CODER_MODEL}{duo}._", ""]
         self._write(root, "JARVS_REPORT.md", "\n".join(lines))
 
     # -- worker --------------------------------------------------------------- #
@@ -865,9 +1168,12 @@ class CodeFoundry:
         verdict = ("checks passed" if checks.get("ok")
                    else ("could not be verified" if not checks.get("checks")
                          else "checks still failing"))
+        peers = [t for t in (project.get("collab") or []) if t.get("role") == "peer"]
+        duet = f" · {len(peers)} Claude review(s)" if peers else ""
         return (f"{len(files)} file(s), {project.get('language') or '?'} · {verdict}"
                 + (f" after {project.get('repairs')} repair round(s)"
                    if project.get("repairs") else "")
+                + duet
                 + f"\n{project.get('path', '')}")
 
     def _worker(self) -> None:

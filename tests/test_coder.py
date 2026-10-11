@@ -58,6 +58,16 @@ GOOD = {
 BROKEN_MAIN = "def main(:\n    pass\n"      # SyntaxError
 
 
+# What the peer's review asks for: a README the original design forgot.
+REVISED_PLAN = PLAN.replace(
+    '{"path": "main.py", "purpose": "argparse CLI entry point"}',
+    '{"path": "main.py", "purpose": "argparse CLI entry point"},'
+    '{"path": "README.md", "purpose": "usage and install notes"}')
+
+REVIEW = ("Add a README.md — a project with no usage notes is not finished. Also pin "
+          "the storage path via an environment variable.")
+
+
 class FakeCoder:
     """Stands in for the Qwen3-Coder-Next endpoint.
 
@@ -66,17 +76,24 @@ class FakeCoder:
     the repair loop has something to repair.
     """
 
-    def __init__(self, files=None, broken=(), plan=PLAN):
+    def __init__(self, files=None, broken=(), plan=PLAN, revised_plan=None):
         self.files = dict(files or GOOD)
         self.broken = set(broken)
         self.plan = plan
+        self.revised_plan = revised_plan
         self.seen: dict[str, int] = {}
         self.calls: list[str] = []
+        self.users: list[str] = []
+        self.revised = False
 
     def __call__(self, system, user, max_tokens=None):
         self.calls.append(system)
+        self.users.append(user or "")
         if "drafting a build plan" in system:
             return self.plan
+        if "revising your build plan" in system:
+            self.revised = True
+            return self.revised_plan or self.plan
         path = self._path(system)
         if "writing ONE file" in system:
             n = self.seen.get(path, 0)
@@ -86,6 +103,9 @@ class FakeCoder:
                 body = BROKEN_MAIN if path == "main.py" else "def broken(:\n    pass\n"
             return f"=== FILE: {path} ===\n```python\n{body}\n```"
         if "fixing a broken file" in system:
+            # "BREAK IT" in the brief = a peer suggestion that makes things worse.
+            if "BREAK IT" in (user or ""):
+                return f"=== FILE: {path} ===\n```python\n{BROKEN_MAIN}\n```"
             return f"=== FILE: {path} ===\n```python\n{self.files.get(path, '')}\n```"
         return "error: unexpected prompt"
 
@@ -165,6 +185,128 @@ class ParsingTests(unittest.TestCase):
 
 
 # --- the build loop ----------------------------------------------------------- #
+
+class DuetTests(unittest.TestCase):
+    """Qwen writes, Claude reviews: the duet inside one build."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.store = os.path.join(self.dir, "code_projects.json")
+        self.projects = os.path.join(self.dir, "projects")
+        self._cfg = (config.CODER_MAX_REPAIRS, config.CODER_EXEC,
+                     config.CODER_COLLAB, config.CODER_COLLAB_ROUNDS,
+                     config.CODER_COLLAB_PLAN, config.CLAUDE_TOKEN_DAILY_CAP)
+        config.CODER_MAX_REPAIRS = 2
+        config.CODER_EXEC = True
+        config.CODER_COLLAB = True
+        config.CODER_COLLAB_ROUNDS = 2
+        config.CODER_COLLAB_PLAN = True
+
+    def tearDown(self):
+        (config.CODER_MAX_REPAIRS, config.CODER_EXEC, config.CODER_COLLAB,
+         config.CODER_COLLAB_ROUNDS, config.CODER_COLLAB_PLAN,
+         config.CLAUDE_TOKEN_DAILY_CAP) = self._cfg
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _foundry(self, coder, review=None):
+        return CodeFoundry(store_path=self.store, generate_fn=coder,
+                           review_fn=review, projects_dir=self.projects)
+
+    def test_peer_review_revises_the_design_before_writing(self):
+        coder = FakeCoder(files={**GOOD, "README.md": "# Habit Tracker\n"},
+                          revised_plan=REVISED_PLAN)
+        briefs: list[str] = []
+        f = self._foundry(coder, review=lambda brief, cwd=None: (
+            briefs.append(brief), REVIEW)[1])
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        self.assertEqual(p["status"], "completed", p.get("error"))
+        self.assertTrue(coder.revised)                # the revision call happened
+        self.assertIn("README.md", [x["path"] for x in p["files"]])
+        # The first brief is the design review, and it ran before the first file write.
+        self.assertIn("BEFORE any", briefs[0])
+        self.assertIn("DESIGN:", briefs[0])
+
+    def test_lgtm_review_leaves_the_design_alone(self):
+        coder = FakeCoder()
+        f = self._foundry(coder, review=lambda brief, cwd=None: "LGTM")
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        self.assertFalse(coder.revised)
+        self.assertEqual(sorted(x["path"] for x in p["files"]),
+                         ["habits.py", "main.py"])
+
+    def test_failure_diagnosis_is_handed_to_the_coder(self):
+        # No local repair budget: only the peer's diagnosis can fix this.
+        config.CODER_MAX_REPAIRS = 0
+        coder = FakeCoder(broken=("main.py",))
+        f = self._foundry(
+            coder,
+            review=lambda brief, cwd=None: ("main.py has a syntax error: `def main(:`.\n"
+                                            "Fix the signature to `def main(argv=None):`."))
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        self.assertEqual(p["status"], "completed", p.get("error"))
+        self.assertTrue(p["verified"])
+        # The peer's words reached the coder's repair prompt.
+        self.assertTrue(any("PEER REVIEW" in u and "syntax error" in u
+                            for u in coder.users))
+        kinds = [t["kind"] for t in p.get("collab") or [] if t["role"] == "peer"]
+        # Design review took the first slot, the diagnosis the second — and that is
+        # the whole budget, so a passing build gets no further critique.
+        self.assertEqual(kinds, ["design review", "failure diagnosis"])
+
+    def test_consultations_are_capped_per_build(self):
+        config.CODER_COLLAB_ROUNDS = 1
+        calls = []
+        coder = FakeCoder(broken=("main.py",))
+
+        def review(brief, cwd=None):
+            calls.append(brief[:40])
+            return "the design is fine, but pin the storage path"
+
+        f = self._foundry(coder, review=review)
+        f.build(f.create("a tiny CLI habit tracker"))
+        # Design review takes the single slot; the diagnosis and critique get none.
+        self.assertEqual(len(calls), 1)
+
+    def test_a_bad_critique_is_reverted(self):
+        config.CODER_MAX_REPAIRS = 0
+        coder = FakeCoder()
+        states = {"n": 0}
+
+        def review(brief, cwd=None):
+            states["n"] += 1
+            # First call is the design review, second the final critique — which
+            # instructs something that breaks the build.
+            return "LGTM" if states["n"] == 1 else "BREAK IT: rewrite main.py badly"
+
+        f = self._foundry(coder, review=review)
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        self.assertTrue(p["verified"])                 # the passing build is kept
+        kinds = [t["kind"] for t in p.get("collab") or []]
+        self.assertIn("critique reverted", kinds)
+        # The project on disk is still the good version.
+        with open(os.path.join(p["path"], "main.py"), encoding="utf-8") as fh:
+            self.assertIn("argparse", fh.read())
+
+    def test_collaboration_is_recorded_in_the_report(self):
+        coder = FakeCoder(files={**GOOD, "README.md": "# Habit Tracker\n"},
+                          revised_plan=REVISED_PLAN)
+        f = self._foundry(coder, review=lambda brief, cwd=None: REVIEW)
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        with open(os.path.join(p["path"], "JARVS_REPORT.md"), encoding="utf-8") as fh:
+            report = fh.read()
+        self.assertIn("Collaboration", report)
+        self.assertIn("Claude (review)", report)
+        self.assertIn("design review", report)
+        self.assertIn("Claude review(s)", p["result"])
+
+    def test_no_peer_means_a_normal_solo_build(self):
+        f = self._foundry(FakeCoder(), review=None)
+        p = f.build(f.create("a tiny CLI habit tracker"))
+        self.assertEqual(p["status"], "completed")
+        self.assertTrue(p["verified"])
+        self.assertEqual(p.get("collab") or [], [])
+        self.assertNotIn("Claude", p["result"])
+
 
 class FoundryTests(unittest.TestCase):
     def setUp(self):

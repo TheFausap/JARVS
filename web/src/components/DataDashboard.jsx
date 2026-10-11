@@ -85,6 +85,10 @@ function SectionLabel({ children }) {
 
 const dash = (v) => (v === null || v === undefined ? "—" : v);
 
+// How many times the peer model weighed in on this build.
+const peerReviews = (p) =>
+  ((p.collab || []).filter((t) => t.role === "peer")).length;
+
 export default function DataDashboard({
   stats, status, jobs = [], system, routines = [], claude = null, code = null,
   onRoutineAction, onToggleVoice,
@@ -191,6 +195,7 @@ export default function DataDashboard({
                           p.language,
                           `${(p.files || []).length} file${(p.files || []).length === 1 ? "" : "s"}`,
                           p.verified ? "verified" : "unverified",
+                          peerReviews(p) ? `claude ×${peerReviews(p)}` : "",
                         ]
                           .filter(Boolean)
                           .join(" · ")}

@@ -21,6 +21,11 @@ A rolling 24h **token ledger** governs usage: Gemma is warned as a cap is approa
 and the request is refused past it. Governance is on tokens, not dollars (the
 subscription path reports tokens, not per-request USD).
 
+The same gates also drive a READ-ONLY mode, :meth:`ClaudeBridge.consult`, used by the
+code foundry: Claude reviews a design, diagnoses a failure or critiques a finished
+project without ever being offered write access. That is the Claude half of the
+Qwen↔Claude duet — the local coder writes, Claude advises.
+
 Design notes:
 * The orchestration is synchronous and depends on an injected ``claude_fn`` so the
   gates are testable without the SDK installed; the default ``claude_fn`` wraps the
@@ -245,6 +250,93 @@ class ClaudeBridge:
         self._learn(result)
         return result
 
+    def consult(self, task: str, context: str = "", cwd: str | None = None) -> dict:
+        """A READ-ONLY consultation: Claude analyses, reviews or diagnoses, never edits.
+
+        This is the bridge's half of the Qwen↔Claude duet. The foundry writes the code;
+        Claude is asked to look at it — the design before a file exists, a failure the
+        local model could not fix, or the finished project. It goes through the same
+        governance as :meth:`request_code` (local pre-flight, budget gate, token
+        ledger, persisted exchange), with two differences:
+
+        * Claude is never offered write access — ``permission_mode='plan'`` throughout.
+        * It is scoped to ``cwd`` (the foundry's project directory) when given, so
+          Claude reads the code under discussion instead of JARVS's own tree.
+
+        Never raises. Returns ``{"status": "ok"|"rejected_local"|"over_budget"|"error",
+        "text": ..., "detail": ..., "tokens": ...}``.
+        """
+        import uuid
+        task = " ".join((task or "").split()).strip()[:4000]
+        try:
+            result = self._consult(task, context, cwd)
+        except Exception as e:  # noqa: BLE001
+            result = {"status": "error", "task": task, "turns": [],
+                      "detail": f"{type(e).__name__}: {e}", "text": ""}
+            self._emit("error", task=task, detail=result["detail"])
+        result["id"] = uuid.uuid4().hex[:8]
+        result["t"] = time.time()
+        result["kind"] = "consult"
+        result["tokens"] = sum(int(t.get("usage", {}).get("in", 0))
+                               + int(t.get("usage", {}).get("out", 0))
+                               for t in result.get("turns", []))
+        with self._lock:
+            self.exchanges.append(result)
+            del self.exchanges[:-40]
+            self._save_exchanges_locked()
+        return result
+
+    def _consult(self, task: str, context: str, cwd: str | None) -> dict:
+        self._emit("started", task=task[:120], mode="consult")
+
+        # GATE 1 — local pre-flight, so a pointless review costs no Claude tokens.
+        verdict = self._generate(
+            "You are JARVS's gatekeeper for asking Claude to review a piece of work. "
+            "Decide whether the question below is specific enough and worth Claude's "
+            "subscription tokens. Reply on one line: 'PROCEED' or "
+            "'REVISE: <one-line reason>'.",
+            f"Question:\\n{task}\\n\\nKnown context:\\n{context or '(none)'}", False)
+        if not verdict.strip().upper().startswith("PROCEED"):
+            self._emit("rejected_local", task=task[:120], detail=verdict, mode="consult")
+            return {"status": "rejected_local", "task": task, "turns": [],
+                    "detail": verdict.strip(), "text": ""}
+
+        # Budget gate — identical to an implementation request.
+        b = self.budget_state()
+        warn = self._warning(b)
+        if b["over"]:
+            self._emit("over_budget", task=task[:120], detail=warn, budget=b,
+                       mode="consult")
+            return {"status": "over_budget", "task": task, "turns": [],
+                    "detail": warn, "text": "", "budget": b}
+
+        prompt = ((warn + "\\n\\n") if warn else "") + (
+            f"A local assistant (JARVS) is asking for a READ-ONLY review from Claude. "
+            f"Analyse and advise — do not edit any file.\\n\\n"
+            f"Question:\\n{task}\\n\\nContext:\\n{context or '(none)'}")
+        reply, usage = self._call_claude(prompt, allow_write=False, resume=None, cwd=cwd)
+        self._record(usage)
+        turns = [{"role": "claude", "text": reply, "usage": usage}]
+        self._emit("done", task=task[:120], detail=reply[:400],
+                   budget=self.budget_state(), mode="consult")
+        return {"status": "ok", "task": task, "turns": turns, "text": reply.strip(),
+                "detail": reply.strip(), "budget": self.budget_state()}
+
+    def _call_claude(self, prompt: str, *, allow_write: bool, resume: str | None,
+                     cwd: str | None = None) -> tuple[str, dict]:
+        """``self._claude`` with an optional directory scope.
+
+        ``claude_fn`` is injected (and in tests is a plain two-arg callable), so a
+        ``cwd`` kwarg is attempted first and dropped if the callable does not accept it.
+        """
+        if cwd:
+            try:
+                return self._claude(prompt, allow_write=allow_write, resume=resume,
+                                    cwd=cwd)
+            except TypeError:
+                pass
+        return self._claude(prompt, allow_write=allow_write, resume=resume)
+
     # -- learning (feed outcomes back into JARVS's memory) -------------------- #
 
     def _learn(self, result: dict) -> None:
@@ -355,12 +447,12 @@ class ClaudeBridge:
     # -- the real Claude call (async SDK, wrapped) ---------------------------- #
 
     def _default_claude(self, prompt: str, *, allow_write: bool,
-                        resume: str | None) -> tuple[str, dict]:
+                        resume: str | None, cwd: str | None = None) -> tuple[str, dict]:
         import asyncio
-        return asyncio.run(self._sdk_call(prompt, allow_write, resume))
+        return asyncio.run(self._sdk_call(prompt, allow_write, resume, cwd))
 
     async def _sdk_call(self, prompt: str, allow_write: bool,
-                        resume: str | None) -> tuple[str, dict]:
+                        resume: str | None, cwd: str | None = None) -> tuple[str, dict]:
         # Refuse to run against the paid API when we were told to use the
         # subscription — the Agent SDK bills the API if ANTHROPIC_API_KEY is set.
         if config.CLAUDE_REQUIRE_SUBSCRIPTION and os.environ.get("ANTHROPIC_API_KEY"):
@@ -374,7 +466,7 @@ class ClaudeBridge:
             TextBlock)
 
         opts_kwargs = dict(
-            cwd=self._cwd,
+            cwd=cwd or self._cwd,
             max_turns=config.CLAUDE_MAX_TURNS,
             permission_mode="acceptEdits" if allow_write else "plan",
             allowed_tools=(["Read", "Grep", "Glob", "Write", "Edit", "MultiEdit"]

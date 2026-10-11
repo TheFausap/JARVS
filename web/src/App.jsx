@@ -10,8 +10,20 @@ import {
   setVoice, streamChat,
 } from "./lib/api.js";
 
+// Read a peer-reviewed build as a collaboration: one line per Claude turn.
+function duetLine(p) {
+  const turns = (p.collab || []).filter((t) => t.role === "peer");
+  if (!turns.length) return "";
+  const lines = turns.map((t) => {
+    const head = (t.text || "").trim().split("\n")[0] || "";
+    return `⟡ Claude · ${t.kind}: ${head.slice(0, 110)}`;
+  });
+  return `\n\n${lines.join("\n")}`;
+}
+
 // How a finished Claude exchange reads when surfaced into the transcript.
 const CLAUDE_LINE = {
+  ok: "advised",
   done: "completed",
   needs_clarification: "needs clarification",
   reject: "was declined by Claude",
@@ -115,7 +127,7 @@ export default function App() {
               id: nextId(), role: "assistant", code: true,
               text:
                 p.status === "completed"
-                  ? `⟡ Build complete — ${p.name || p.topic}\n\n${p.result || ""}\n\n${p.summary || ""}`
+                  ? `⟡ Build complete — ${p.name || p.topic}\n\n${p.result || ""}\n\n${p.summary || ""}${duetLine(p)}`
                   : `⟡ Build failed — ${p.topic}\n\n${p.error || ""}`,
             }]);
           }

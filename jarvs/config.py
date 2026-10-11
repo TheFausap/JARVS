@@ -163,6 +163,21 @@ CODER_MAX_PENDING = _int("JARVS_CODER_MAX_PENDING", 2, floor=1)
 CODER_EXEC = _flag("JARVS_CODER_EXEC", True)
 CODER_TEST_TIMEOUT = _int("JARVS_CODER_TEST_TIMEOUT", 180, floor=10)
 
+# --- the duet: Qwen and Claude coding together -------------------------------- #
+# When the Claude bridge is ON, a foundry build stops being Qwen alone and becomes a
+# bounded dialogue: Qwen3-Coder-Next plans, writes and repairs (local, unlimited),
+# while Claude reviews the design, diagnoses stubborn failures, and critiques the
+# finished project — read-only, through the bridge's own gates and token ledger.
+# Cheap local tokens do the bulk; expensive Claude tokens go where they change the
+# outcome. Off (or bridge off) => Qwen builds alone, exactly as before.
+CODER_COLLAB = _flag("JARVS_CODER_COLLAB", True)
+# How many Claude consultations ONE build may spend (plan review, failure diagnosis
+# and the final critique all draw on this budget).
+CODER_COLLAB_ROUNDS = _int("JARVS_CODER_COLLAB_ROUNDS", 2, floor=0)
+# Review the design BEFORE a file is written — the cheapest possible moment to be
+# told the plan won't work.
+CODER_COLLAB_PLAN = _flag("JARVS_CODER_COLLAB_PLAN", True)
+
 
 # --- routines (recurring scheduled tasks) ------------------------------------- #
 

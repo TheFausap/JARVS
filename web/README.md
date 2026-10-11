@@ -61,4 +61,7 @@ the transcript as a `JARVS · FORGE` message.
 ## Config
 
 - `JARVS_WEB_HOST` / `JARVS_WEB_PORT` — bind address (default `127.0.0.1:8765`).
+- `JARVS_CLAUDE_BRIDGE=1` turns the FORGE panel's builds into a duet: Qwen3-Coder-Next
+  writes the project and Claude reviews the design, diagnoses failures and critiques the
+  result (`JARVS_CODER_COLLAB_ROUNDS` caps the reviews per build).
 - All model/voice/memory knobs are the usual `JARVS_*` vars (see `jarvs/config.py`).

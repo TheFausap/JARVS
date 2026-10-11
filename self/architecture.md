@@ -137,9 +137,25 @@ repair, for a bounded number of rounds. Projects land in a projects directory wi
 report of the design, the files and the check output. The work is sandboxed: writes
 cannot escape the projects directory, only an allowlist of interpreters may be executed,
 never through a shell, and execution can be switched off entirely. Two coding paths
-therefore coexist: an explicit Claude Code delegation goes to the governed bridge, and
-any other "go build me this" request goes to the foundry — the bridge wins when it is
-enabled and the request names Claude.
+therefore coexist, and when the bridge is on they work together as a duet.
+
+The duet: Qwen3-Coder-Next plans, writes and repairs the project — local tokens, no
+meter — while Claude is consulted read-only at the three moments where a second opinion
+changes the outcome. It reviews the design *before any file is written*; if the local
+repairs cannot fix a failure, it reads the project directory and diagnoses the root
+cause, which becomes Qwen's repair brief; and once the project passes, it gets one final
+critique, which is acted on only if it names something concrete and is **rolled back if
+the change breaks the checks**. A build may spend only a fixed number of these
+consultations, and every one goes through the same gates and token ledger as a
+delegation — the difference is that Claude is never offered write access and is scoped
+to the project under discussion rather than JARVS's own tree. With the bridge off, the
+foundry builds alone and nothing else changes.
+
+Routing keeps their territories distinct: an explicit Claude delegation (the user named
+Claude) stays with the bridge, because that is about the user's existing tree; a build
+request goes to the foundry — solo or as a duet; and any other code task with the bridge
+on goes to the bridge. Work on code that already exists (a named file, "the parser", a
+maintenance verb) is never hijacked into a greenfield project.
 
 ## Voice and the web UI
 
