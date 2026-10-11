@@ -71,7 +71,10 @@ class ManagerTests(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-        shutil.rmtree(self.dir)
+        # The daemon worker keeps atomically rewriting jobs.json (write .tmp ->
+        # os.replace), so a plain rmtree can race its rename and hit FileNotFoundError
+        # on jobs.json.tmp. Best-effort cleanup — the daemon dies with the process.
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def _mgr(self, generate):
         return BackgroundManager(generate_fn=generate, store_path=self.store)

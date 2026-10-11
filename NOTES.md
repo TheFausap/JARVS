@@ -85,9 +85,14 @@ Background/agent-like layer added after the core build:
   jobs on a timer. A plain-language scheduling request ("add daily searches about X
   and Y") is turned into structured routines by one LLM extraction pass and actually
   created — closing the earlier gap where the model *claimed* to schedule searches but
-  nothing was created. Intervals: hourly/daily/weekly/every-N. Web UI: `/api/routines`
-  + a ROUTINES panel. REPL: `/routines [rm|off|on|run <id>]`. v1 fires on an interval
-  from creation; clock-time anchoring ("08:00 digest") is a possible follow-up.
+  nothing was created. Intervals: hourly/daily/weekly/every-N.
+- **Conversational management**: ask JARVS to change an existing routine — "move the
+  LLM digest to 7am", "pause the war-news one", "cancel it". A bounded LLM router
+  (`handle_request`) sees the current routines and emits a validated action
+  (reschedule / pause / resume / remove / create), so a change edits the routine rather
+  than duplicating it. Clock-time anchoring supported ("at 08:00", "every morning" →
+  next run snaps to that local time). Web UI: `/api/routines` + a ROUTINES panel with
+  run / pause / delete buttons (`POST /api/routines`); REPL `/routines [rm|off|on|run]`.
 - Not ported: idle web-learning, meditation.
 - **System awareness** (`jarvs/system_sense.py`): live host telemetry from the OS —
   CPU load/util, memory, NVIDIA GPU (util/VRAM/temp via nvidia-smi), disk, thermals,

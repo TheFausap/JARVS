@@ -102,6 +102,16 @@ DREAM_EVERY = _int("JARVS_DREAM_EVERY", 12, floor=0)
 # Master switch for any live web access, and whether background jobs may use it.
 ALLOW_WEB = _flag("JARVS_ALLOW_WEB", True)
 BACKGROUND_WEB = _flag("JARVS_BACKGROUND_WEB", True)
+# Live web search on the REPLY path: when a turn needs current info, search and inject a
+# [WEB] block before generating, so JARVS verifies instead of answering from its cutoff.
+WEB_REPLY = _flag("JARVS_WEB_REPLY", True)
+WEB_REPLY_RESULTS = _int("JARVS_WEB_REPLY_RESULTS", 5, floor=1)
+WEB_REPLY_CHARS = _int("JARVS_WEB_REPLY_CHARS", 4000, floor=500)
+
+
+# --- standing rules (durable user-set directives) ----------------------------- #
+
+RULES_ENABLED = _flag("JARVS_RULES", True)
 
 
 # --- system awareness (hardware / OS / geolocation) --------------------------- #
@@ -131,6 +141,51 @@ ROUTINES_ENABLED = _flag("JARVS_ROUTINES", True)
 ROUTINE_TICK = _int("JARVS_ROUTINE_TICK", 30, floor=5)
 # Default interval when a request says "repeating"/"recurring" without a period.
 ROUTINE_DEFAULT_INTERVAL = _int("JARVS_ROUTINE_DEFAULT_INTERVAL", 86400, floor=60)
+
+# --- Claude Code bridge (delegate coding to Claude, via the Agent SDK) --------- #
+# Off by default. When on, coding requests are routed to Claude Code through the
+# `claude-agent-sdk` (authenticated separately via `claude login` — JARVS never holds
+# the credentials). Governance is on tokens, not dollars: a rolling 24h ledger warns
+# as the cap is approached and refuses past it.
+
+CLAUDE_BRIDGE_ENABLED = _flag("JARVS_CLAUDE_BRIDGE", False)
+# Working directory Claude is scoped to (defaults to the repo root).
+CLAUDE_BRIDGE_CWD = _env("JARVS_CLAUDE_BRIDGE_CWD", str(ROOT))
+# Max agent turns per Claude call (caps how long one exchange can run).
+CLAUDE_MAX_TURNS = _int("JARVS_CLAUDE_MAX_TURNS", 4, floor=1)
+# Rolling-24h token cap across all Claude calls (0 == unlimited), and the fraction
+# of it at which JARVS starts warning before a call.
+CLAUDE_TOKEN_DAILY_CAP = _int("JARVS_CLAUDE_TOKEN_DAILY_CAP", 200_000, floor=0)
+try:
+    CLAUDE_TOKEN_WARN_AT = min(1.0, max(0.0, float(
+        _env("JARVS_CLAUDE_TOKEN_WARN_AT", "0.8") or "0.8")))
+except ValueError:
+    CLAUDE_TOKEN_WARN_AT = 0.8
+# Optional model override for Claude (empty == the SDK/CLI default).
+CLAUDE_MODEL = _env("JARVS_CLAUDE_MODEL", "")
+# Refuse to run if ANTHROPIC_API_KEY is set, so the subscription is used (not the
+# paid API). Set to 0 only if you deliberately want API-key billing.
+CLAUDE_REQUIRE_SUBSCRIPTION = _flag("JARVS_CLAUDE_REQUIRE_SUBSCRIPTION", True)
+
+
+# --- self-model (JARVS's dossier about its own architecture) ------------------ #
+# A curated set of docs describing how JARVS is built, embedded and cosine-searched,
+# kept OUTSIDE episodic/semantic memory so it never leaks into ordinary recall. It is
+# consulted only when the user asks JARVS about itself (intent gate), and only chunks
+# above the relevance floor are injected (relevance gate). External self-documentation,
+# not introspection of the model's weights.
+
+SELF_MODEL_ENABLED = _flag("JARVS_SELF_MODEL", True)
+SELF_DIR = Path(os.environ.get("JARVS_SELF_DIR", ROOT / "self"))
+SELF_RECALL_K = _int("JARVS_SELF_RECALL_K", 4, floor=1)
+# Floor is modest on purpose: the intent gate already confirms the user is asking about
+# JARVS, so this only ranks/trims dossier chunks (calibrated against the MiniLM encoder,
+# where a relevant self-question scores ~0.18–0.52 and an unrelated one stays < ~0.14).
+try:
+    SELF_RECALL_MIN = float(_env("JARVS_SELF_RECALL_MIN", "0.15") or "0.15")
+except ValueError:
+    SELF_RECALL_MIN = 0.15
+
 
 # --- voice -------------------------------------------------------------------- #
 

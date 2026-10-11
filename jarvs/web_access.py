@@ -142,3 +142,68 @@ def needs_web_search(user_input: str) -> bool:
     if any(marker in text for marker in _WEB_MARKERS):
         return True
     return text.endswith("?") and text.startswith(_FACT_STARTERS)
+
+
+# Cues that a claim/question is time-sensitive — version/release/availability talk,
+# dates, prices, "is there a X", a product followed by a version number (Gemma 4,
+# Llama 3, GPT 5). Used to LOWER the search bar when the user has set a standing rule to
+# always verify current information.
+_TIME_SENSITIVE_RE = re.compile(
+    r"\b(?:latest|newest|current|recent|release[ds]?|releasing|announce[ds]?|"
+    r"unveil\w*|available|out yet|come out|coming|exists?|is there|version|"
+    r"successor|next (?:version|gen\w*)|new(?:est)? (?:version|model|release)|"
+    r"v?\d+(?:\.\d+)+|today|right now|as of|20\d\d|price|stock|who won|"
+    r"up[- ]?to[- ]?date|still (?:the )?(?:newest|latest|current)|"
+    r"[a-z][a-z0-9.+-]{2,}\s+\d{1,2}(?:\.\d+)?)\b", re.I)
+
+# A question ABOUT JARVS/the conversation ("did you find…", "are you sure?") rather than
+# a factual lookup — not something to run a web search for.
+_META_Q_RE = re.compile(
+    r"^\s*(?:did|do|does|can|could|would|will|have|has|are|were)\s+you\b", re.I)
+
+
+def looks_time_sensitive(user_input: str) -> bool:
+    """True when the message turns on current facts (versions, releases, dates, prices)
+    — part of the lower bar used under a 'always verify online' standing rule."""
+    return bool(_TIME_SENSITIVE_RE.search(user_input or ""))
+
+
+# A follow-up asking about a search the user expected ("did you find something?", "any
+# luck?", "and?") — not itself searchable, but a cue to run the PREVIOUS question's
+# search and present the results.
+_FOLLOWUP_RE = re.compile(
+    r"\bdid you (?:find|search|look|get)\b|\bfound (?:anything|something|it)\b|"
+    r"\bfind anything\b|\bany (?:luck|results?|news|updates?)\b|"
+    r"\bwhat did you find\b|\bresults?\b\s*\??|^\s*(?:and|so|well|any(?:thing)?)\s*\?",
+    re.I)
+
+
+def is_search_followup(user_input: str) -> bool:
+    """True when the user is asking about the outcome of a search they expected."""
+    return bool(_FOLLOWUP_RE.search(user_input or ""))
+
+
+def last_searchable(history: list[dict], lower_bar: bool = True) -> str:
+    """The most recent prior USER message that warranted a search, scanning backwards —
+    the query to re-run when the user follows up with 'did you find something?'."""
+    for msg in reversed(history or []):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if should_search(content, lower_bar=lower_bar):
+                return content
+    return ""
+
+
+def should_search(user_input: str, lower_bar: bool = False) -> bool:
+    """Decide whether the reply path should run a live search. Always searches on the
+    explicit markers. With ``lower_bar`` (a standing 'verify online' rule is on) it is
+    deliberately aggressive — it also searches on time-sensitive cues and on any genuine
+    factual question (ends with '?' and is not a question about JARVS itself)."""
+    if needs_web_search(user_input):
+        return True
+    if not lower_bar:
+        return False
+    if looks_time_sensitive(user_input):
+        return True
+    t = (user_input or "").strip()
+    return t.endswith("?") and not _META_Q_RE.match(t)

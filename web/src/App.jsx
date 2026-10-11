@@ -2,10 +2,23 @@ import { useEffect, useRef, useState } from "react";
 import StatusRing from "./components/StatusRing.jsx";
 import MessageStream from "./components/MessageStream.jsx";
 import DataDashboard from "./components/DataDashboard.jsx";
+import MemoryPanel from "./components/MemoryPanel.jsx";
 import InputTerminal from "./components/InputTerminal.jsx";
 import {
-  getStatus, getStats, getJobs, getSystem, getRoutines, setVoice, streamChat,
+  getStatus, getStats, getJobs, getSystem, getRoutines, getClaude, routineAction,
+  setVoice, streamChat,
 } from "./lib/api.js";
+
+// How a finished Claude exchange reads when surfaced into the transcript.
+const CLAUDE_LINE = {
+  done: "completed",
+  needs_clarification: "needs clarification",
+  reject: "was declined by Claude",
+  rejected_local: "was held back by JARVS",
+  held: "was held after review",
+  over_budget: "was refused (token budget)",
+  error: "errored",
+};
 
 let _id = 0;
 const nextId = () => `m${_id++}`;
@@ -19,9 +32,12 @@ export default function App() {
   const [jobs, setJobs] = useState([]);
   const [system, setSystem] = useState(null);
   const [routines, setRoutines] = useState([]);
+  const [claude, setClaude] = useState(null);
   const busyRef = useRef(false);
   const seenDoneRef = useRef(new Set());
   const firstJobsRef = useRef(true);
+  const seenClaudeRef = useRef(new Set());
+  const firstClaudeRef = useRef(true);
 
   // Initial status + periodic dashboard / jobs polling.
   useEffect(() => {
@@ -60,11 +76,39 @@ export default function App() {
       getRoutines()
         .then((d) => alive && d.enabled && setRoutines(d.routines || []))
         .catch(() => {});
+      getClaude()
+        .then((d) => {
+          if (!alive || !d.enabled) return;
+          setClaude(d);
+          // Surface newly-finished Claude exchanges into the transcript, so JARVS
+          // reports the verdict/result (and its lessons) back in the conversation.
+          for (const e of d.exchanges || []) {
+            const key = `${e.id}:${e.status}`;
+            if (seenClaudeRef.current.has(key)) continue;
+            seenClaudeRef.current.add(key);
+            if (firstClaudeRef.current) continue;  // don't replay history on load
+            const verb = CLAUDE_LINE[e.status] || e.status;
+            const body = e.detail ? `\n\n${e.detail}` : "";
+            setMessages((m) => [...m, {
+              id: nextId(), role: "assistant", background: true,
+              text: `⟡ Claude — "${e.task}" ${verb}.${body}`,
+            }]);
+          }
+          firstClaudeRef.current = false;
+        })
+        .catch(() => {});
     };
     tick();
     const h = setInterval(tick, 3000);
     return () => { alive = false; clearInterval(h); };
   }, []);
+
+  const onRoutineAction = async (action, id) => {
+    try {
+      const d = await routineAction(action, id);
+      if (d.routines) setRoutines(d.routines);
+    } catch { /* ignore */ }
+  };
 
   const toggleVoice = async (enabled) => {
     try {
@@ -108,7 +152,8 @@ export default function App() {
   return (
     <div className="flex h-full w-full">
       <DataDashboard stats={stats} status={status} jobs={jobs} system={system}
-                     routines={routines} onToggleVoice={toggleVoice} />
+                     routines={routines} claude={claude} onRoutineAction={onRoutineAction}
+                     onToggleVoice={toggleVoice} />
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* header: the central status ring */}
@@ -119,6 +164,8 @@ export default function App() {
         <MessageStream messages={messages} />
         <InputTerminal onSubmit={send} busy={busy} />
       </main>
+
+      <MemoryPanel stats={stats} status={status} />
     </div>
   );
 }
