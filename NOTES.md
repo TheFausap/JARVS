@@ -86,9 +86,14 @@ Background/agent-like layer added after the core build:
   jobs on a timer. A plain-language scheduling request ("add daily searches about X
   and Y") is turned into structured routines by one LLM extraction pass and actually
   created — closing the earlier gap where the model *claimed* to schedule searches but
-  nothing was created. Intervals: hourly/daily/weekly/every-N. Web UI: `/api/routines`
-  + a ROUTINES panel. REPL: `/routines [rm|off|on|run <id>]`. v1 fires on an interval
-  from creation; clock-time anchoring ("08:00 digest") is a possible follow-up.
+  nothing was created. Intervals: hourly/daily/weekly/every-N.
+- **Conversational management**: ask JARVS to change an existing routine — "move the
+  LLM digest to 7am", "pause the war-news one", "cancel it". A bounded LLM router
+  (`handle_request`) sees the current routines and emits a validated action
+  (reschedule / pause / resume / remove / create), so a change edits the routine rather
+  than duplicating it. Clock-time anchoring supported ("at 08:00", "every morning" →
+  next run snaps to that local time). Web UI: `/api/routines` + a ROUTINES panel with
+  run / pause / delete buttons (`POST /api/routines`); REPL `/routines [rm|off|on|run]`.
 - Not ported: idle web-learning, meditation.
 - **System awareness** (`jarvs/system_sense.py`): live host telemetry from the OS —
   CPU load/util, memory, NVIDIA GPU (util/VRAM/temp via nvidia-smi), disk, thermals,
@@ -130,6 +135,15 @@ Background/agent-like layer added after the core build:
   can also defer a build itself with a `[[CODE: topic]]` marker, mirroring
   `[[THINK:]]`. Builds run on their own worker thread, off the reply path, like
   background jobs. REPL: `/code`, `/projects [rm|open|tree <id>]`.
+- **Two coding paths, one router** (`_route_coding` in `chat.py`): the foundry and the
+  Claude Code bridge both answer "write me some code" and each has its own detector, so
+  importing both would have collided on the name. `claude_bridge.is_code_request` is
+  imported as `is_claude_request` and stays the *narrower* test (an explicit 'claude
+  code', Claude + a coding word, or a tight code-verb→code-noun phrase); the foundry's
+  detector is the broader 'build me a thing' test. Routing: schedules → Claude bridge
+  (when enabled) → foundry → background job. So an explicit Claude delegation keeps
+  going to Claude, and everything else that reads as a build request goes to
+  Qwen3-Coder-Next. The foundry is on by default; the bridge is opt-in.
 - **Web UI**: `/api/code` (GET projects / POST a topic), a FORGE widget + project list
   in the sidebar, and finished builds surface in the transcript as `JARVS · FORGE`.
   The system head carries a `[AUTONOMOUS CODING]` block so the model says "on it"

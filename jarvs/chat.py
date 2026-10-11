@@ -12,20 +12,32 @@ Run the REPL with:  python -m jarvs.chat
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
 import uuid
 
-from . import client, config, system_sense
+from . import client, config, system_sense, web_access
 from .background import BackgroundManager, should_auto_queue, extract_think_markers
+from .claude_bridge import ClaudeBridge, is_code_request as is_claude_request
+from .rules import RulesStore, is_rule_request, implies_web_verify
 from .coder import (CoderBackend, CodeFoundry, is_code_request,
                     extract_code_markers)
-from .routines import RoutineScheduler, is_schedule_request, human_interval
+from .routines import (
+    RoutineScheduler, is_schedule_request, is_routine_command, schedule_label,
+)
 from .critic import Critic
-from .memory import Memory
+from .memory import Memory, is_remember_request, remember_from_request
 from .meta_dreaming import MetaDreamer
+from .self_model import SelfModel, is_self_query
 from .voice import JarvsVoice
+
+# Does the user name Claude explicitly? Used to avoid silently answering a Claude
+# delegation with a different executor when the bridge is off. (The bridge's own
+# detector also matches code-verb phrases that never mention Claude — those are fine
+# to route onward, so this stays narrower than `is_claude_request`.)
+_NAMES_CLAUDE_RE = re.compile(r"\bclaude\b", re.I)
 
 # The persona head. JARVS is a calm, precise, lightly wry assistant — competent and
 # unhurried, never obsequious. Kept short on purpose: durable behaviour will come
@@ -49,6 +61,23 @@ CODER_CAPABILITY = (
     "results only once you actually have them. Never describe files, output, or test "
     "results you do not have."
 )
+
+
+def distill_search_query(text: str, generate_fn) -> str:
+    """Turn a conversational message into a tight web-search query — just the key
+    entities/terms — so a rambling ask ("I admire your stubbornness, but can you look
+    online for Gemma 3 and Gemma 4?") searches for "Gemma 3 Gemma 4", not "stubbornness".
+    Falls back to the cleaned raw text if the model returns nothing."""
+    raw = " ".join((text or "").split())
+    try:
+        q = (generate_fn(
+            "Rewrite the user's message as a concise web-search query: keep only the key "
+            "entities and terms, drop pleasantries and meta-commentary, no punctuation or "
+            "quotes, at most 12 words. Output only the query.", raw, False) or "").strip()
+    except Exception:  # noqa: BLE001
+        q = ""
+    q = " ".join(q.split()).strip(" \"'")[:200]
+    return q or raw[:200]
 
 
 class JarvsSession:
@@ -117,6 +146,38 @@ class JarvsSession:
                 store_path=os.path.join(str(config.DATA_DIR), "routines.json"),
                 generate_fn=client.generate)
             self.routines.start()
+
+        # Governed conduit for delegating coding to Claude Code (off by default).
+        # JARVS never holds the credentials; the Agent SDK authenticates separately.
+        self.claude_bridge: ClaudeBridge | None = None
+        if config.CLAUDE_BRIDGE_ENABLED:
+            self.claude_bridge = ClaudeBridge(
+                generate_fn=client.generate,
+                ledger_path=os.path.join(str(config.DATA_DIR), "claude_ledger.json"),
+                exchanges_path=os.path.join(str(config.DATA_DIR),
+                                            "claude_exchanges.json"),
+                cwd=config.CLAUDE_BRIDGE_CWD,
+                # Feed each outcome back as a durable fact so JARVS learns from its own
+                # missteps and from Claude's observations about the codebase.
+                memory_fn=lambda t: self.memory.remember_fact(t, source="claude_bridge"))
+
+        # Standing rules: durable user-set directives injected every turn (and the
+        # actionable web-verify flag the reply path consults).
+        self.rules: RulesStore | None = None
+        if config.RULES_ENABLED:
+            self.rules = RulesStore(
+                os.path.join(str(config.DATA_DIR), "rules.json"))
+
+        # Self-model: JARVS's dossier about its own architecture. Needs the memory
+        # embedder; consulted only when the user asks JARVS about itself.
+        self.self_model: SelfModel | None = None
+        if config.SELF_MODEL_ENABLED and self.memory.enabled:
+            try:
+                self.self_model = SelfModel(
+                    str(config.SELF_DIR), self.memory._embed,
+                    recall_k=config.SELF_RECALL_K, min_sim=config.SELF_RECALL_MIN)
+            except Exception:  # noqa: BLE001 — never block startup on the dossier
+                self.self_model = None
 
         # Turn counter driving the automatic dream (associative consolidation) cadence.
         self._turns_since_dream = 0
@@ -189,12 +250,66 @@ class JarvsSession:
         if config.SYSTEM_SENSE and system_sense.needs_system_info(user_input):
             head += "\n\n" + system_sense.summary_block(
                 include_geo=system_sense.needs_location(user_input))
+        # When the user asks JARVS about itself, add the relevant dossier chunks.
+        if self.self_model is not None and is_self_query(user_input):
+            block = self.self_model.self_block(user_input)
+            if block:
+                head += "\n\n" + block
+        # Durable standing directives the user has set.
+        if self.rules is not None:
+            rules_block = self.rules.block()
+            if rules_block:
+                head += "\n\n" + rules_block
+        # Live web: tell JARVS it CAN search (so it never denies having internet), and
+        # when the turn needs current facts, fetch them and inject a [WEB] block to
+        # ground the reply instead of answering from the training cutoff.
+        if config.ALLOW_WEB and config.WEB_REPLY and web_access.DDGS_AVAILABLE:
+            head += ("\n\n[CAPABILITIES] A live web-search tool is run FOR you by the "
+                     "system before you reply; when it runs, the results appear below "
+                     "under [WEB]. You cannot start a search yourself, run one in the "
+                     "background, or 'stand by' for one — a search either already ran "
+                     "this turn (a [WEB] block is present) or it did not. Rules: never "
+                     "say you lack internet access; never claim you are searching or have "
+                     "searched unless a [WEB] block is present; if a [WEB] block is "
+                     "present, base your answer on it and cite the source URLs; if the "
+                     "question needs current facts and there is NO [WEB] block, say you "
+                     "don't have live results for it rather than inventing an answer.")
+            lower_bar = bool(self.rules and self.rules.web_verify)
+            query = ""
+            if web_access.should_search(user_input, lower_bar=lower_bar):
+                query = user_input
+            elif web_access.is_search_followup(user_input):
+                # "did you find something?" — the model may have promised a search last
+                # turn; run it now for the previous question and present real results.
+                query = web_access.last_searchable(self.history)
+            if query:
+                web_block = self._web_block(query)
+                if web_block:
+                    head += "\n\n" + web_block
         # Tell JARVS what the foundry can actually do, and — more importantly — that it
         # must not narrate a build that hasn't happened. Without this the model happily
         # "writes" files in prose that never reach disk.
         if self.coder is not None:
             head += "\n\n" + CODER_CAPABILITY
         return head
+
+    def _web_block(self, query: str) -> str:
+        """Distil ``query`` into clean search terms, run a live web search, and render a
+        ``[WEB]`` block (or "" if unavailable/empty). Best-effort — never raises into the
+        reply path."""
+        search_q = distill_search_query(query, client.generate)
+        try:
+            results = web_access.web_search(search_q,
+                                            max_results=config.WEB_REPLY_RESULTS)
+        except Exception:  # noqa: BLE001
+            return ""
+        if (not results.strip()
+                or results.startswith(("Search failed:", "Search unavailable:"))
+                or results == "Search returned no results."):
+            return ""
+        return (f"[WEB]\nLive web results fetched just now (search: \"{search_q}\"). "
+                "Ground your answer in them, cite sources by URL, and say plainly if they "
+                "do not cover the question:\n" + results[:config.WEB_REPLY_CHARS])
 
     def reply(self, user_input: str, learn: bool = True) -> str:
         """Run one turn: record the user line, generate, record + return the reply.
@@ -226,35 +341,100 @@ class JarvsSession:
 
     def _dispatch_background(self, user_input: str, reply: str) -> str:
         """Queue any deferred work this turn implies — a build request, model-emitted
-        ``[[CODE:]]`` / ``[[THINK:]]`` markers, and plain-language 'do it in the
-        background' requests — and return the reply with the markers stripped so they
-        are never shown, spoken, or stored."""
+        ``[[CODE:]]`` / ``[[THINK:]]`` markers, explicit remember/rule requests, and
+        plain-language 'do it in the background' asks — and return the reply with the
+        markers stripped so they are never shown, spoken, or stored."""
         # The model can defer a build itself, exactly like [[THINK:]] for research.
         if self.coder is not None:
             reply, topics = extract_code_markers(reply)
             for topic in topics:
                 self.coder.queue(topic)
-        # A build request goes to the foundry — a topic in, a working project on disk
-        # out. Checked before the background path (and independent of it) so the
-        # foundry keeps working when background research is switched off.
-        if self.coder is not None and is_code_request(user_input):
-            self.build(user_input)
-            return reply
+        # Explicit "remember this" — pin a durable fact off the reply path. Kept
+        # independent of the background subsystem so it works even when that is off.
+        if self.memory.enabled and is_remember_request(user_input):
+            threading.Thread(target=self._remember_from_request,
+                             args=(user_input, list(self.history)), daemon=True).start()
+        # "From now on, …" — adopt a durable standing rule (independent of background).
+        if self.rules is not None and is_rule_request(user_input):
+            threading.Thread(target=self._adopt_rule,
+                             args=(user_input,), daemon=True).start()
         if self.background is None:
+            # Coding never needed the background worker (routines do, so they are
+            # already None here) — honour it and stop.
+            self._route_coding(user_input)
             return reply
         clean, tasks = extract_think_markers(reply)
         for task in tasks:
             self.background.queue(task)
-        # A recurring-schedule request creates routines (one LLM extraction pass, off
-        # the reply path) — not a single one-shot job. Otherwise, a plain "do this in
-        # the background" queues one job.
-        if self.routines is not None and is_schedule_request(user_input):
-            threading.Thread(target=self.routines.plan_and_create,
+        # A scheduling OR routine-management request is routed to the scheduler (one
+        # bounded LLM pass, off the reply path): it creates a routine or changes an
+        # existing one. Otherwise, a plain "do this in the background" queues one job.
+        if self.routines is not None and (is_schedule_request(user_input)
+                                          or is_routine_command(user_input)):
+            threading.Thread(target=self.routines.handle_request,
                              args=(user_input,), daemon=True).start()
+        elif self._route_coding(user_input):
+            pass                       # claimed by Claude or the foundry
         elif should_auto_queue(user_input):
             self.background.queue(user_input,
                                   context=self.memory.recall_block(user_input))
         return clean
+
+    def _route_coding(self, user_input: str) -> bool:
+        """Send a coding request to its executor. Returns True if one claimed it.
+
+        Two coding paths coexist, with deliberately different detectors:
+        an explicit, opt-in Claude Code delegation (``is_claude_request``: a 'claude
+        code' mention, or Claude + a coding word) goes to the governed bridge; anything
+        else that reads as 'go build me this' (``is_code_request``: build verb + software
+        object) goes to the local foundry, which writes and verifies the project itself.
+        """
+        if self.claude_bridge is not None and is_claude_request(user_input):
+            # Delegate coding to Claude off the reply path; the dialogue + token
+            # governance surface as bridge events (drained before the next prompt).
+            threading.Thread(
+                target=self.claude_bridge.request_code,
+                args=(user_input, self.memory.recall_block(user_input)),
+                daemon=True).start()
+            return True
+        if _NAMES_CLAUDE_RE.search(user_input) and self.claude_bridge is None:
+            # The user named Claude but the bridge is off — don't quietly build it with
+            # a different model. Leave it to the reply path, which can say so.
+            return False
+        if self.coder is not None and is_code_request(user_input):
+            # A topic in, a working project on disk out. Runs on the foundry's own
+            # worker thread, so the turn is never blocked by a build.
+            self.build(user_input)
+            return True
+        return False
+
+    def _remember_from_request(self, user_input: str, history: list[dict]) -> None:
+        """Store what the user asked JARVS to remember (an inline clause, or the
+        previous reply). Runs on a daemon thread; best-effort."""
+        try:
+            remember_from_request(
+                user_input, history, client.generate,
+                lambda t: self.memory.remember_fact(t, source="user"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _adopt_rule(self, user_input: str) -> None:
+        """Distil a 'from now on …' request into a crisp standing directive, store it,
+        and flip the web-verify flag when the rule is about checking the internet. Runs
+        on a daemon thread; best-effort."""
+        if self.rules is None:
+            return
+        try:
+            directive = client.generate(
+                "Rewrite the user's instruction as ONE concise standing rule for an "
+                "assistant to follow, imperative voice, at most 30 words. Output only "
+                "the rule.", user_input, False).strip()
+            directive = " ".join(directive.split())[:400] or user_input
+            self.rules.add(directive)
+            if implies_web_verify(user_input) or implies_web_verify(directive):
+                self.rules.set_web_verify(True)
+        except Exception:  # noqa: BLE001
+            pass
 
     def run_learning(self, user_input: str, reply: str) -> dict:
         """Grade the reply and, when enough new critiques have accumulated, run a
@@ -348,7 +528,10 @@ _HELP = (
     "                     repairs itself) — or just ask me to build something\n"
     "/projects [rm|open|tree <id>]   built projects and where they live\n"
     "/routines [rm|off|on|run <id>]   recurring scheduled tasks\n"
+    "/claude <task>       delegate a coding task to Claude Code (token-governed)\n"
     "/system              live host telemetry (CPU/GPU/mem/time/location)\n"
+    "/self [reload]       JARVS's self-architecture dossier (stats; reload re-reads it)\n"
+    "/rules [add <text>|rm <id>|web on|off]   standing rules (durable directives)\n"
     "/status              backend + voice + memory status\n"
     "/reset               clear the conversation (memory persists)\n"
     "/help                this list\n"
@@ -356,86 +539,92 @@ _HELP = (
 )
 
 
-def _handle_command(session: JarvsSession, line: str) -> bool:
-    """Return True if the line was a command (and was handled)."""
+def dispatch_command(session: JarvsSession, line: str) -> str:
+    """Run a slash command and RETURN its text output. Shared by the REPL and the web
+    UI so both expose exactly the same commands. ``quit``/``exit`` are REPL-only and
+    handled by the caller (:func:`_handle_command`), never here."""
     cmd, _, arg = line[1:].partition(" ")
     cmd, arg = cmd.strip().lower(), arg.strip()   # keep arg case for /remember
-    if cmd in ("quit", "exit", "q"):
-        raise SystemExit(0)
+    out: list[str] = []
+    p = out.append
     if cmd == "help":
-        print(_HELP)
+        p(_HELP)
     elif cmd == "reset":
         session.reset()
-        print("  · conversation cleared (memory persists)")
+        p("  · conversation cleared (memory persists)")
     elif cmd == "status":
         ok, detail = client.health()
-        print(f"  · {detail}")
-        print(f"  · {session.voice.status()}")
-        print(f"  · {session.memory.status()}")
+        p(f"  · {detail}")
+        p(f"  · {session.voice.status()}")
+        p(f"  · {session.memory.status()}")
         if session.meta_dreamer is not None:
             snap = session.meta_dreamer.snapshot()
-            print(f"  · critic: on · meta-dreaming: {snap['promoted_areas']} promoted / "
-                  f"{snap['total_areas']} focus areas")
+            p(f"  · critic: on · meta-dreaming: {snap['promoted_areas']} promoted / "
+              f"{snap['total_areas']} focus areas")
         else:
-            print(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
+            p(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
         if session.background is not None:
-            print(f"  · {session.background.status()}")
+            p(f"  · {session.background.status()}")
         if session.coder is not None:
             _, detail = session.coder_backend_status()
-            print(f"  · {detail}")
-            print(f"  · {session.coder.status()}")
+            p(f"  · {detail}")
+            p(f"  · {session.coder.status()}")
         if session.routines is not None:
-            print(f"  · {session.routines.status()}")
+            p(f"  · {session.routines.status()}")
+        if session.claude_bridge is not None:
+            p(f"  · {session.claude_bridge.status()}")
         if config.SYSTEM_SENSE:
-            print(f"  · {system_sense.status()}")
-        print(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
-              f"turns={len(session.history)}")
+            p(f"  · {system_sense.status()}")
+        if session.self_model is not None:
+            p(f"  · {session.self_model.stats()}")
+        if session.rules is not None:
+            p(f"  · {session.rules.status()}")
+        p(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
+          f"turns={len(session.history)}")
     elif cmd == "voice":
         if arg.lower() in ("on", "off"):
             session.voice.set_enabled(arg.lower() == "on")
         else:
             session.voice.set_enabled(not session.voice.enabled)
-        print(f"  · {session.voice.status()}")
+        p(f"  · {session.voice.status()}")
     elif cmd == "memory":
-        print(f"  · {session.memory.status()}")
+        p(f"  · {session.memory.status()}")
     elif cmd == "remember":
         if not arg:
-            print("  · usage: /remember <fact to store>")
+            p("  · usage: /remember <fact to store>")
         else:
             mid = session.memory.remember_fact(arg)
-            print(f"  · stored fact {mid[:8]}" if mid
-                  else "  · memory unavailable — nothing stored")
+            p(f"  · stored fact {mid[:8]}" if mid
+              else "  · memory unavailable — nothing stored")
     elif cmd == "dream":
-        print("  · weaving associative links…")
-        print(f"  · {session.memory.dream()}")
+        p(f"  · {session.memory.dream()}")
     elif cmd == "critic":
         if session.meta_dreamer is None:
-            print("  · critic: on, meta-dreaming off" if session.critic
-                  else "  · critic: off")
+            p("  · critic: on, meta-dreaming off" if session.critic
+              else "  · critic: off")
         else:
             snap = session.meta_dreamer.snapshot()
-            print(f"  · critic: {'on' if session.critic else 'off'}  "
-                  f"pending log lines: {snap['pending_lines']}/"
-                  f"{snap['distill_min_new']} until next meta pass")
+            p(f"  · critic: {'on' if session.critic else 'off'}  "
+              f"pending log lines: {snap['pending_lines']}/"
+              f"{snap['distill_min_new']} until next meta pass")
     elif cmd == "metadream":
         if session.meta_dreamer is None:
-            print("  · meta-dreaming is disabled (JARVS_METADREAM=0)")
+            p("  · meta-dreaming is disabled (JARVS_METADREAM=0)")
         else:
             if arg.lower() == "run":
-                print("  · running a distill pass…")
                 added = session.meta_dreamer.distill()
-                print(f"  · distilled {added} focus area(s)")
+                p(f"  · distilled {added} focus area(s)")
             snap = session.meta_dreamer.snapshot()
-            print(f"  · focus areas: {snap['total_areas']} total, "
-                  f"{snap['promoted_areas']} promoted (>= {snap['promote_min_pairs']} "
-                  f"sessions); {snap['pending_lines']} critique lines pending")
+            p(f"  · focus areas: {snap['total_areas']} total, "
+              f"{snap['promoted_areas']} promoted (>= {snap['promote_min_pairs']} "
+              f"sessions); {snap['pending_lines']} critique lines pending")
             for a in snap["areas"][:5]:
                 star = "★" if a["pairs"] >= snap["promote_min_pairs"] else " "
-                print(f"    {star} {a['area']} (sessions={a['pairs']}, hits={a['hits']})"
-                      + (f": {a['specific']}" if a["specific"] else ""))
+                p(f"    {star} {a['area']} (sessions={a['pairs']}, hits={a['hits']})"
+                  + (f": {a['specific']}" if a["specific"] else ""))
     elif cmd == "routines":
         if session.routines is None:
-            print("  · routines are disabled (needs background work enabled)")
+            p("  · routines are disabled (needs background work enabled)")
         else:
             sub, _, rid = arg.partition(" ")
             sub, rid = sub.strip().lower(), rid.strip()
@@ -446,82 +635,133 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
                     ok = session.routines.run_now(rid)
                 else:
                     ok = session.routines.set_enabled(rid, sub == "on")
-                print(f"  · {'done' if ok else 'no routine '+rid}")
-            print(f"  · {session.routines.status()}")
+                p(f"  · {'done' if ok else 'no routine '+rid}")
+            p(f"  · {session.routines.status()}")
             now = time.time()
             for r in session.routines.list():
                 when = max(0, int(float(r["next_run"]) - now))
                 state = "on " if r["enabled"] else "off"
-                print(f"    [{state}] {r['id']} · {r['description']} "
-                      f"({human_interval(r['interval_sec'])}, "
-                      f"next in {when // 3600}h{(when % 3600) // 60}m, runs={r['runs']})")
+                p(f"    [{state}] {r['id']} · {r['description']} "
+                  f"({schedule_label(r)}, "
+                  f"next in {when // 3600}h{(when % 3600) // 60}m, runs={r['runs']})")
     elif cmd == "system":
-        print(system_sense.summary_block(include_geo=True))
+        p(system_sense.summary_block(include_geo=True))
+    elif cmd == "rules":
+        if session.rules is None:
+            p("  · standing rules are disabled (JARVS_RULES=0)")
+        else:
+            sub, _, rest = arg.partition(" ")
+            sub, rest = sub.strip().lower(), rest.strip()
+            if sub == "add" and rest:
+                r = session.rules.add(rest)
+                if r and implies_web_verify(rest):
+                    session.rules.set_web_verify(True)
+                p(f"  · added rule {r['id']}" if r else "  · not added (too short/dupe)")
+            elif sub == "rm" and rest:
+                p(f"  · {'removed' if session.rules.remove(rest) else 'no rule '+rest}")
+            elif sub == "web" and rest.lower() in ("on", "off"):
+                session.rules.set_web_verify(rest.lower() == "on")
+                p(f"  · web-verify {rest.lower()}")
+            p(f"  · {session.rules.status()}")
+            for r in session.rules.list():
+                p(f"    [{r['id']}] {r['text']}")
+    elif cmd == "self":
+        if session.self_model is None:
+            p("  · self-model is disabled (JARVS_SELF_MODEL=0 or memory off)")
+        else:
+            if arg.lower() == "reload":
+                session.self_model.load()
+                p("  · reloaded dossier")
+            p(f"  · {session.self_model.stats()}")
     elif cmd == "background":
         if session.background is None:
-            print("  · background work is disabled (JARVS_BACKGROUND=0)")
+            p("  · background work is disabled (JARVS_BACKGROUND=0)")
         elif not arg:
-            print("  · usage: /background <task to work on>")
+            p("  · usage: /background <task to work on>")
         else:
             job = session.background.queue(arg)
-            print(f"  · queued job {job['id']} — I'll work on it and report back"
-                  if job else "  · not queued (queue full, duplicate, or too short)")
+            p(f"  · queued job {job['id']} — I'll work on it and report back"
+              if job else "  · not queued (queue full, duplicate, or too short)")
     elif cmd == "code":
         if session.coder is None:
-            print("  · the code foundry is disabled (JARVS_CODER=0)")
+            p("  · the code foundry is disabled (JARVS_CODER=0)")
         elif not arg:
-            print("  · usage: /code <topic>  (e.g. /code a terminal habit tracker)")
+            p("  · usage: /code <topic>  (e.g. /code a terminal habit tracker)")
         else:
             project = session.coder.queue(arg)
             if project is None:
-                print("  · not queued (queue full, duplicate, or topic too short)")
+                p("  · not queued (queue full, duplicate, or topic too short)")
             else:
-                print(f"  · build {project['id']} queued — {config.CODER_MODEL} is on it")
-                print(f"    {arg[:100]}")
+                p(f"  · build {project['id']} queued — {config.CODER_MODEL} is on it")
+                p(f"    {arg[:100]}")
     elif cmd == "projects":
         if session.coder is None:
-            print("  · the code foundry is disabled (JARVS_CODER=0)")
+            p("  · the code foundry is disabled (JARVS_CODER=0)")
         else:
             sub, _, pid = arg.partition(" ")
             sub, pid = sub.strip().lower(), pid.strip()
             if sub in ("rm", "open", "tree") and pid:
                 if sub == "rm":
-                    print(f"  · {'removed' if session.coder.remove(pid) else 'no project '+pid}")
+                    p(f"  · {'removed' if session.coder.remove(pid) else 'no project '+pid}")
                 else:
-                    p = session.coder.get(pid)
-                    print(f"  · {p['path']}" if p and p.get("path")
-                          else f"  · no project {pid}")
-                    if p and sub == "tree":
-                        print(_project_tree(p.get("path", "")))
-            print(f"  · {session.coder.status()}")
-            for p in session.coder.recent(8):
+                    proj = session.coder.get(pid)
+                    p(f"  · {proj['path']}" if proj and proj.get("path")
+                      else f"  · no project {pid}")
+                    if proj and sub == "tree":
+                        p(_project_tree(proj.get("path", "")))
+            p(f"  · {session.coder.status()}")
+            for proj in session.coder.recent(8):
                 mark = {"completed": "✔", "failed": "✗", "running": "⟳",
-                        "queued": "·"}.get(p["status"], "?")
-                line = (f"    [{mark}] {p['id']} · "
-                        f"{p.get('name') or p['topic'][:40]} "
-                        f"({p.get('language') or '?'}, "
-                        f"{len(p.get('files') or [])} files"
-                        f"{', verified' if p.get('verified') else ''})")
-                print(line + (f" — {p['progress']}" if p["status"] == "running" else ""))
-                if p.get("path"):
-                    print(f"        {p['path']}")
-                if p["status"] == "failed" and p.get("error"):
-                    print(f"        ✗ {p['error'][:160]}")
+                        "queued": "·"}.get(proj["status"], "?")
+                line = (f"    [{mark}] {proj['id']} · "
+                        f"{proj.get('name') or proj['topic'][:40]} "
+                        f"({proj.get('language') or '?'}, "
+                        f"{len(proj.get('files') or [])} files"
+                        f"{', verified' if proj.get('verified') else ''})")
+                p(line + (f" — {proj['progress']}" if proj["status"] == "running" else ""))
+                if proj.get("path"):
+                    p(f"        {proj['path']}")
+                if proj["status"] == "failed" and proj.get("error"):
+                    p(f"        ✗ {proj['error'][:160]}")
     elif cmd == "jobs":
         if session.background is None:
-            print("  · background work is disabled")
+            p("  · background work is disabled")
         else:
-            print(f"  · {session.background.status()}")
+            p(f"  · {session.background.status()}")
             for j in session.background.recent(8):
-                line = f"    [{j['status']}] {j['id']} · {j['task'][:60]}"
-                print(line)
+                p(f"    [{j['status']}] {j['id']} · {j['task'][:60]}")
                 if j["status"] == "completed" and j.get("result"):
-                    print(f"        → {j['result'][:200]}"
-                          + ("…" if len(j['result']) > 200 else ""))
+                    p(f"        → {j['result'][:200]}"
+                      + ("…" if len(j['result']) > 200 else ""))
                 elif j["status"] == "failed" and j.get("error"):
-                    print(f"        ✗ {j['error'][:160]}")
+                    p(f"        ✗ {j['error'][:160]}")
+    elif cmd == "claude":
+        if session.claude_bridge is None:
+            p("  · the Claude bridge is disabled (JARVS_CLAUDE_BRIDGE=0)")
+        elif not arg:
+            p("  · usage: /claude <coding task to delegate to Claude Code>")
+            p(f"  · {session.claude_bridge.status()}")
+        else:
+            threading.Thread(
+                target=session.claude_bridge.request_code,
+                args=(arg, session.memory.recall_block(arg)),
+                daemon=True).start()
+            p("  · delegating to Claude — I'll report the verdict and result back")
     else:
-        print(f"  · unknown command: /{cmd} (try /help)")
+        p(f"  · unknown command: /{cmd} (try /help)")
+    return "\n".join(out)
+
+
+def _handle_command(session: JarvsSession, line: str) -> bool:
+    """REPL wrapper around :func:`dispatch_command`: handle quit, print the output."""
+    cmd = line[1:].partition(" ")[0].strip().lower()
+    if cmd in ("quit", "exit", "q"):
+        raise SystemExit(0)
+    if cmd == "dream":
+        print("  · weaving associative links…")
+    elif cmd == "metadream" and line[1:].partition(" ")[2].strip().lower() == "run":
+        print("  · running a distill pass…")
+    print(dispatch_command(session, line))
     return True
 
 
@@ -575,8 +815,33 @@ def _flush_background(session: JarvsSession) -> None:
         for ev in session.routines.drain_events():
             if ev["kind"] == "created":
                 print(f"\n  ⟡ routine scheduled: {ev['description']}")
+            elif ev["kind"] == "rescheduled":
+                print(f"\n  ⟡ routine updated: {ev['description']}")
             elif ev["kind"] == "fired":
                 print(f"\n  ⟡ routine fired: {ev['description']} (running now)")
+    if session.claude_bridge is not None:
+        for ev in session.claude_bridge.drain_events():
+            task = (ev.get("task") or "")[:60]
+            if ev["kind"] == "started":
+                print(f"\n  ⟡ claude: working on — {task}")
+            elif ev["kind"] == "done":
+                print(f"\n  ⟡ claude: done — {task}")
+                if ev.get("detail"):
+                    print(f"    {ev['detail']}")
+            elif ev["kind"] == "rejected_local":
+                print(f"\n  ⟡ claude: not sent (JARVS held it back) — {task}")
+                if ev.get("detail"):
+                    print(f"    {ev['detail'][:200]}")
+            elif ev["kind"] in ("needs_clarification", "reject", "no_verdict", "held"):
+                print(f"\n  ⟡ claude: paused ({ev['kind']}) — {task}")
+                if ev.get("detail"):
+                    print(f"    {ev['detail'][:200]}")
+            elif ev["kind"] == "over_budget":
+                print(f"\n  ⟡ claude: refused (token budget) — {task}")
+                if ev.get("detail"):
+                    print(f"    {ev['detail']}")
+            elif ev["kind"] == "error":
+                print(f"\n  ⟡ claude: error — {task}: {ev.get('detail', '')[:160]}")
     if session.background is None:
         return
     for ev in session.background.drain_events():
@@ -608,6 +873,12 @@ def main() -> None:
         print(f"  · {session.coder.status()}")
     if session.routines is not None:
         print(f"  · {session.routines.status()}")
+    if session.claude_bridge is not None:
+        print(f"  · {session.claude_bridge.status()}")
+    if session.self_model is not None:
+        print(f"  · {session.self_model.stats()}")
+    if session.rules is not None:
+        print(f"  · {session.rules.status()}")
     while True:
         _flush_background(session)
         try:

@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from . import client, config, system_sense
-from .chat import JarvsSession
+from .chat import JarvsSession, dispatch_command
 
 # The production bundle Vite writes (web/ -> jarvs/web_dist via vite.config.js).
 _WEB_DIR = os.path.join(os.path.dirname(__file__), "web_dist")
@@ -162,6 +162,11 @@ class JarvsHandler(BaseHTTPRequestHandler):
             return {"enabled": False, "routines": []}
         return {"enabled": True, "routines": self.session.routines.list()}
 
+    def _claude_payload(self) -> dict:
+        if self.session.claude_bridge is None:
+            return {"enabled": False, "exchanges": []}
+        return self.session.claude_bridge.payload()
+
     def _system_payload(self) -> dict:
         if not config.SYSTEM_SENSE:
             return {"enabled": False}
@@ -186,6 +191,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._send_json(self._routines_payload())
         elif route == "/api/code":
             self._send_json(self._code_payload())
+        elif route == "/api/claude":
+            self._send_json(self._claude_payload())
         elif route.startswith("/api/"):
             self.send_error(404, "Not found")
         elif not os.path.isdir(_WEB_DIR):
@@ -220,6 +227,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self.session.voice.set_enabled(bool(body.get("enabled")))
             self._send_json({"voice": self.session.voice.status(),
                              "voice_enabled": self.session.voice.enabled})
+        elif route == "/api/routines":
+            self._routine_action()
         elif route == "/api/chat":
             self._stream_chat()
         elif route == "/api/code":
@@ -243,6 +252,27 @@ class JarvsHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "project": project})
 
+    def _routine_action(self):
+        """Panel controls: {action: pause|resume|run|remove, id}."""
+        sched = self.session.routines
+        if sched is None:
+            self._send_json({"error": "routines disabled"}, status=400)
+            return
+        body = self._read_json()
+        action, rid = str(body.get("action", "")).lower(), body.get("id")
+        if action == "pause":
+            sched.set_enabled(rid, False)
+        elif action == "resume":
+            sched.set_enabled(rid, True)
+        elif action == "run":
+            sched.run_now(rid)
+        elif action == "remove":
+            sched.remove(rid)
+        else:
+            self._send_json({"error": "unknown action"}, status=400)
+            return
+        self._send_json({"routines": sched.list()})
+
     def _sse_event(self, event: str, data: dict):
         payload = f"event: {event}\ndata: {json.dumps(data)}\n\n"
         self.wfile.write(payload.encode("utf-8"))
@@ -262,6 +292,16 @@ class JarvsHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.close_connection = True
         self.end_headers()
+        # Slash commands run server-side and come back as a single reply — the same
+        # commands the REPL exposes — without touching the model or the conversation.
+        if message.startswith("/"):
+            try:
+                text = dispatch_command(self.session, message)
+            except Exception as e:  # noqa: BLE001
+                text = f"  · command failed: {type(e).__name__}: {e}"
+            self._sse_event("done", {"reply": text or "  · (no output)",
+                                     "latency_ms": 0})
+            return
         start = time.time()
         parts: list[str] = []
         try:

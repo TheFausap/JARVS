@@ -32,9 +32,24 @@ export async function getRoutines() {
   return r.json();
 }
 
+export async function getClaude() {
+  const r = await fetch("/api/claude");
+  if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
 export async function getProjects() {
   const r = await fetch("/api/code");
   if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
+export async function routineAction(action, id) {
+  const r = await fetch("/api/routines", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, id }),
+  });
   return r.json();
 }
 

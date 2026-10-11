@@ -22,6 +22,7 @@ The recall block it renders is appended to the system head in
 from __future__ import annotations
 
 import math
+import re
 import time
 import uuid
 
@@ -33,6 +34,107 @@ from .vector_store import SQLiteVectorStore
 def _cosine_from_l2(dist: float) -> float:
     """For unit-norm vectors, ||a-b||^2 = 2(1 - cos). Invert to recover cosine."""
     return 1.0 - (dist * dist) / 2.0
+
+
+# --- explicit "remember this" intent (pure, testable) ------------------------- #
+# Lets the user pin something durably in plain language ("store this into memory",
+# "remember that the deploy runs at 02:00"), parallel to the /remember REPL command.
+# Kept high-precision: the trigger must lead a clause (imperative), so a statement
+# like "I remember that film" is not mistaken for a command.
+
+_REMEMBER_RE = re.compile(
+    r"(?:^|[.!?;,]\s*|\bplease\s+|\bcan you\s+|\bcould you\s+|\bjarvs[,:]?\s+)"
+    r"(?:remember\s+(?:this|that|it|to|how|the)|store\s+(?:this|that|it)|"
+    r"save\s+(?:this|that|it)|note\s+(?:this|that|it|down)|"
+    r"keep\s+(?:this|that|it)?\s*in mind|memori[sz]e\s+(?:this|that|it)|"
+    r"don'?t forget|(?:add|put)\s+(?:this|that|it)\s+(?:in|into|to)\s+(?:your\s+)?memory)",
+    re.I)
+
+# Pull the explicit clause out of "remember that X" / "note to X"; returns "" when the
+# request is purely referential ("store this", "remember what you said") so the caller
+# falls back to the previous assistant turn.
+_INLINE_RE = re.compile(
+    r"\b(?:remember|note|memori[sz]e|store|save)\b[\s,:]*"
+    r"(?:that|to|how|the fact that)?\s*(.+)", re.I | re.S)
+_REFERENTIAL_RE = re.compile(
+    r"^(?:this|that|it|these|those|the above|everything|all(?:\s+of)?\s+this|"
+    r"what\s+(?:you|we|i)\b.*|the\s+(?:last|previous|above)\b.*)$", re.I)
+
+
+def is_remember_request(text: str) -> bool:
+    """True when the user is asking JARVS to store something in plain language."""
+    return bool(_REMEMBER_RE.search(text or ""))
+
+
+def extract_inline_fact(text: str) -> str:
+    """The explicit thing to remember if the user stated it inline, else "" (meaning
+    'remember the previous reply')."""
+    m = _INLINE_RE.search(text or "")
+    if not m:
+        return ""
+    clause = m.group(1).strip()
+    # Drop trailing "into memory", "for later", and filler particles ("down", "here",
+    # "for me", "please") so "note this down" reads as referential, not a fact.
+    clause = re.sub(r"\b(?:in|into|to)\s+(?:your\s+)?memory\b.*$", "", clause, flags=re.I)
+    clause = re.sub(r"\bfor\s+later\b.*$", "", clause, flags=re.I)
+    clause = re.sub(r"\b(?:down|here|please|for me)\b\s*$", "", clause, flags=re.I)
+    clause = clause.strip(" .!?,")
+    if not clause or _REFERENTIAL_RE.fullmatch(clause):
+        return ""
+    return clause
+
+
+def _last_assistant(history: list[dict]) -> tuple[str, str]:
+    """The most recent assistant turn and the user turn that prompted it, scanning
+    from the end. Returns (assistant_text, preceding_user_text)."""
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") == "assistant":
+            prompt = ""
+            for j in range(i - 1, -1, -1):
+                if history[j].get("role") == "user":
+                    prompt = history[j].get("content", "")
+                    break
+            return history[i].get("content", ""), prompt
+    return "", ""
+
+
+def distill_fact(source: str, context: str, generate_fn) -> str:
+    """Condense the thing-to-remember into one durable, self-contained fact. Falls
+    back to the raw source (trimmed) if the model returns nothing."""
+    source = (source or "").strip()
+    if not source:
+        return ""
+    system = (
+        "You turn a note into ONE durable, self-contained fact worth remembering about "
+        "the user or the topic, in the third person, present tense, at most 40 words. "
+        "Output only the fact — no preamble, no quotes. If nothing is worth storing, "
+        "repeat the input unchanged.")
+    user = ((f"Conversation context:\n{context}\n\n" if context else "")
+            + f"Remember this:\n{source}")
+    try:
+        fact = (generate_fn(system, user, False) or "").strip()
+    except Exception:  # noqa: BLE001
+        fact = ""
+    fact = fact or source
+    return " ".join(fact.split())[:600]
+
+
+def remember_from_request(user_input: str, history: list[dict], generate_fn,
+                          remember_fn) -> str | None:
+    """Resolve what the user asked JARVS to remember (an inline clause, or the previous
+    assistant reply), distill it, and store it via ``remember_fn(text) -> id | None``.
+    Returns the stored fact, or None when there was nothing to store."""
+    inline = extract_inline_fact(user_input)
+    if inline:
+        source, context = inline, ""
+    else:
+        source, context = _last_assistant(history or [])
+    if not source.strip():
+        return None
+    fact = distill_fact(source, context, generate_fn)
+    if not fact:
+        return None
+    return fact if remember_fn(fact) else None
 
 
 class Memory:

@@ -3,6 +3,7 @@ mocked backend so no live model is needed."""
 
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -114,6 +115,70 @@ class FoundryDispatchTests(unittest.TestCase):
         out = self.session._dispatch_background("hello", "on it [[CODE: a snake game]]")
         self.assertEqual(out, "on it")
         self.assertEqual(self.session.coder.list()[0]["topic"], "a snake game")
+
+
+class CodingRouteTests(unittest.TestCase):
+    """Two coding paths, one router: Claude Code (opt-in) vs the local foundry."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from jarvs import config
+        from jarvs.coder import CoderBackend
+
+        self.dir = tempfile.mkdtemp()
+        self._cleanup = lambda: shutil.rmtree(self.dir, ignore_errors=True)
+        self._data, self._complete = config.DATA_DIR, CoderBackend.complete
+        self._bridge = config.CLAUDE_BRIDGE_ENABLED
+        config.DATA_DIR = Path(self.dir)
+        CoderBackend.complete = lambda self, system, user, max_tokens=None: ""
+        self.session = JarvsSession(speak=False, voice=_SilentVoice())
+
+    def tearDown(self):
+        from jarvs import config
+        from jarvs.coder import CoderBackend
+        config.DATA_DIR = self._data
+        config.CLAUDE_BRIDGE_ENABLED = self._bridge
+        CoderBackend.complete = self._complete
+        self._cleanup()
+
+    def _enable_bridge(self):
+        """Rebuild the session with the bridge on and its executor stubbed."""
+        from jarvs import config
+        config.CLAUDE_BRIDGE_ENABLED = True
+        self.session = JarvsSession(speak=False, voice=_SilentVoice())
+        self.bridge_calls: list[str] = []
+        # Runs on a daemon thread, so record the call and join briefly below.
+        self.session.claude_bridge.request_code = (
+            lambda task, context="": (self.bridge_calls.append(task),
+                                      {"status": "done"})[1])
+
+    def test_build_request_goes_to_the_foundry(self):
+        self.session._dispatch_background("build me a CLI habit tracker", "On it.")
+        self.assertEqual(len(self.session.coder.list()), 1)
+
+    def test_claude_named_but_bridge_off_is_not_silently_rerouted(self):
+        # The user named a specific tool that isn't enabled: the foundry must not
+        # quietly answer it with a different model.
+        self.session._dispatch_background("use claude code to fix parser.py", "Ok.")
+        self.assertEqual(self.session.coder.list(), [])
+
+    def test_bridge_wins_when_enabled(self):
+        self._enable_bridge()
+        self.session._route_coding("use claude code to fix parser.py")
+        self.assertEqual(self.session.coder.list(), [])
+        time.sleep(0.2)
+        self.assertEqual(len(self.bridge_calls), 1)
+
+    def test_plain_build_still_uses_the_foundry_with_bridge_on(self):
+        self._enable_bridge()
+        # No mention of Claude, and 'habit tracker' is not a Claude-bridge code noun.
+        self.session._route_coding("build me a CLI habit tracker")
+        self.assertEqual(len(self.session.coder.list()), 1)
+        time.sleep(0.2)
+        self.assertEqual(self.bridge_calls, [])
 
 
 class _SilentVoice:

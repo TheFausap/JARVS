@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from jarvs.routines import (  # noqa: E402
     RoutineScheduler, parse_interval, is_schedule_request, human_interval,
+    parse_time_of_day, is_routine_command, schedule_label,
 )
 
 
@@ -39,6 +40,34 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(is_schedule_request("research this once in the background"))
 
 
+class TimeParseTests(unittest.TestCase):
+    def test_times(self):
+        self.assertEqual(parse_time_of_day("7am"), (7, 0))
+        self.assertEqual(parse_time_of_day("8 pm"), (20, 0))
+        self.assertEqual(parse_time_of_day("08:30"), (8, 30))
+        self.assertEqual(parse_time_of_day("at 19:00"), (19, 0))
+        self.assertEqual(parse_time_of_day("every morning"), (8, 0))
+        self.assertEqual(parse_time_of_day("12am"), (0, 0))
+        self.assertEqual(parse_time_of_day("12pm"), (12, 0))
+
+    def test_interval_not_mistaken_for_time(self):
+        self.assertIsNone(parse_time_of_day("every 6 hours"))
+        self.assertIsNone(parse_time_of_day("daily"))
+
+
+class ManageIntentTests(unittest.TestCase):
+    def test_positive(self):
+        for t in ["move the LLM digest to 7am", "pause the war news routine",
+                  "cancel the daily search", "change the schedule to every 6 hours",
+                  "reschedule it to the morning"]:
+            self.assertTrue(is_routine_command(t), t)
+
+    def test_negative(self):
+        for t in ["what's the weather?", "research this in the background",
+                  "tell me about routines in general"]:
+            self.assertFalse(is_routine_command(t), t)
+
+
 class _FakeBG:
     def __init__(self):
         self.queued = []
@@ -57,7 +86,7 @@ class SchedulerTests(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-        shutil.rmtree(self.dir)
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def _sched(self, generate=lambda s, u, r: "[]"):
         return RoutineScheduler(background=self.bg, store_path=self.store,
@@ -99,6 +128,50 @@ class SchedulerTests(unittest.TestCase):
     def test_plan_ignores_non_schedule(self):
         s = self._sched(generate=lambda sy, u, r: "[]")
         self.assertEqual(s.plan_and_create("just chatting"), [])
+
+    def test_reschedule_interval_and_time(self):
+        s = self._sched()
+        r = s.add("x", "A recurring daily task to run.", 86400)
+        self.assertTrue(s.reschedule(r["id"], interval_sec=21600, at=(7, 0)))
+        got = s.list()[0]
+        self.assertEqual(got["interval_sec"], 21600)
+        self.assertEqual(got["at_hour"], 7)
+        self.assertIn("at 07:00", schedule_label(got))
+
+    def test_handle_request_reschedule_not_duplicate(self):
+        s = self._sched()
+        r = s.add("LLM news", "Research LLM architecture news daily.", 86400)
+        # the router returns a reschedule action referencing the real id
+        action = f'[{{"action":"reschedule","id":"{r["id"]}","interval":null,"time":"07:00"}}]'
+        s._generate = lambda sy, u, rr: action
+        applied = s.handle_request("move the LLM digest to 7am")
+        self.assertEqual(applied, [("rescheduled", r["id"])])
+        self.assertEqual(len(s.list()), 1)            # changed, not duplicated
+        self.assertEqual(s.list()[0]["at_hour"], 7)
+
+    def test_handle_request_pause_and_remove(self):
+        s = self._sched()
+        r = s.add("war news", "Summarize Russia-Ukraine news daily.", 86400)
+        s._generate = lambda sy, u, rr: f'[{{"action":"pause","id":"{r["id"]}"}}]'
+        self.assertEqual(s.handle_request("pause the war news routine"),
+                         [("paused", r["id"])])
+        self.assertFalse(s.list()[0]["enabled"])
+        s._generate = lambda sy, u, rr: f'[{{"action":"remove","id":"{r["id"]}"}}]'
+        self.assertEqual(s.handle_request("cancel it"), [("removed", r["id"])])
+        self.assertEqual(s.list(), [])
+
+    def test_handle_request_create(self):
+        s = self._sched(generate=lambda sy, u, rr:
+                        '[{"action":"create","description":"Crypto","task":"Research '
+                        'crypto market news.","interval":"hourly","time":null}]')
+        applied = s.handle_request("every hour, check crypto news")
+        self.assertEqual(applied[0][0], "created")
+        self.assertEqual(s.list()[0]["interval_sec"], 3600)
+
+    def test_handle_request_ignores_unknown_id(self):
+        s = self._sched(generate=lambda sy, u, rr:
+                        '[{"action":"reschedule","id":"deadbeef","time":"07:00"}]')
+        self.assertEqual(s.handle_request("change the thing"), [])
 
     def test_persistence(self):
         s = self._sched()
