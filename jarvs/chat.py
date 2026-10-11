@@ -19,6 +19,8 @@ import uuid
 
 from . import client, config, system_sense
 from .background import BackgroundManager, should_auto_queue, extract_think_markers
+from .coder import (CoderBackend, CodeFoundry, is_code_request,
+                    extract_code_markers)
 from .routines import RoutineScheduler, is_schedule_request, human_interval
 from .critic import Critic
 from .memory import Memory
@@ -35,6 +37,17 @@ DEFAULT_SYSTEM = (
     "it. You never invent facts; when you are unsure, you say so plainly. Your "
     "replies are spoken aloud, so you write clean prose — no markdown tables or "
     "code fences unless the user is clearly reading, not listening."
+)
+
+# Appended to the system head while the foundry is enabled (see build_system). The
+# point is the second half: without it the model narrates files it never wrote.
+CODER_CAPABILITY = (
+    "[AUTONOMOUS CODING] You have a code foundry: given a topic you plan a small, "
+    "runnable project, write every file to disk, run its checks, and repair failures "
+    "until it builds — all on your own, off the conversation. When the user asks you "
+    "to build something, say you are on it; report the finished path and the check "
+    "results only once you actually have them. Never describe files, output, or test "
+    "results you do not have."
 )
 
 
@@ -83,6 +96,18 @@ class JarvsSession:
                 persona=self.system,
                 memory_fn=lambda t: self.memory.remember_fact(t, source="background"))
 
+        # Autonomous coding: a topic in, a working project out on disk. Runs on the
+        # Qwen3-Coder-Next backend (jarvs/coder.py) with its own worker thread, so a
+        # build never blocks the conversation.
+        self.coder: CodeFoundry | None = None
+        self.coder_backend: CoderBackend | None = None
+        if config.CODER_ENABLED:
+            self.coder_backend = CoderBackend()
+            self.coder = CodeFoundry(
+                generate_fn=self.coder_backend.complete,
+                store_path=os.path.join(str(config.DATA_DIR), "code_projects.json"),
+                memory_fn=lambda t: self.memory.remember_fact(t, source="coder"))
+
         # Recurring routines: a scheduler that fires background jobs on a timer. Needs
         # the background manager to run anything, so it is gated on it existing.
         self.routines: RoutineScheduler | None = None
@@ -101,6 +126,30 @@ class JarvsSession:
     @staticmethod
     def _log(msg: str) -> None:
         print(f"  · {msg}", file=sys.stderr)
+
+    # -- foundry helpers ------------------------------------------------------ #
+
+    def coder_backend_status(self) -> tuple[bool, str]:
+        """(ok, detail) for the coding backend — falls back to a static line when the
+        foundry is off, so callers can print it unconditionally."""
+        if self.coder_backend is None:
+            return False, "coder: disabled (JARVS_CODER=0)"
+        return self.coder_backend.health()
+
+    def build(self, topic: str) -> dict | None:
+        """Queue an autonomous build. Returns the project dict, or None if refused."""
+        if self.coder is None:
+            return None
+        return self.coder.queue(topic)
+
+    def build_now(self, topic: str) -> dict | None:
+        """Build synchronously (used by the REPL and tests); None if refused."""
+        if self.coder is None:
+            return None
+        project = self.coder.create(topic)
+        if project is None:
+            return None
+        return self.coder.build(project)
 
     # -- history budgeting ----------------------------------------------------- #
 
@@ -140,6 +189,11 @@ class JarvsSession:
         if config.SYSTEM_SENSE and system_sense.needs_system_info(user_input):
             head += "\n\n" + system_sense.summary_block(
                 include_geo=system_sense.needs_location(user_input))
+        # Tell JARVS what the foundry can actually do, and — more importantly — that it
+        # must not narrate a build that hasn't happened. Without this the model happily
+        # "writes" files in prose that never reach disk.
+        if self.coder is not None:
+            head += "\n\n" + CODER_CAPABILITY
         return head
 
     def reply(self, user_input: str, learn: bool = True) -> str:
@@ -171,9 +225,21 @@ class JarvsSession:
         return bool(self.critic or self.meta_dreamer or config.DREAM_EVERY > 0)
 
     def _dispatch_background(self, user_input: str, reply: str) -> str:
-        """Queue any deferred work this turn implies — model-emitted ``[[THINK:]]``
-        markers and plain-language 'do it in the background' requests — and return the
-        reply with the markers stripped so they are never shown, spoken, or stored."""
+        """Queue any deferred work this turn implies — a build request, model-emitted
+        ``[[CODE:]]`` / ``[[THINK:]]`` markers, and plain-language 'do it in the
+        background' requests — and return the reply with the markers stripped so they
+        are never shown, spoken, or stored."""
+        # The model can defer a build itself, exactly like [[THINK:]] for research.
+        if self.coder is not None:
+            reply, topics = extract_code_markers(reply)
+            for topic in topics:
+                self.coder.queue(topic)
+        # A build request goes to the foundry — a topic in, a working project on disk
+        # out. Checked before the background path (and independent of it) so the
+        # foundry keeps working when background research is switched off.
+        if self.coder is not None and is_code_request(user_input):
+            self.build(user_input)
+            return reply
         if self.background is None:
             return reply
         clean, tasks = extract_think_markers(reply)
@@ -278,6 +344,9 @@ _HELP = (
     "/metadream [run]     meta-dreaming focus areas; 'run' forces a distill pass\n"
     "/background <task>   queue a deferred task (runs off-conversation, may use web)\n"
     "/jobs                recent background jobs + their results\n"
+    "/code <topic>        build a working project from a topic (plans, writes, tests,\n"
+    "                     repairs itself) — or just ask me to build something\n"
+    "/projects [rm|open|tree <id>]   built projects and where they live\n"
     "/routines [rm|off|on|run <id>]   recurring scheduled tasks\n"
     "/system              live host telemetry (CPU/GPU/mem/time/location)\n"
     "/status              backend + voice + memory status\n"
@@ -311,6 +380,10 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
             print(f"  · critic: {'on' if session.critic else 'off'} · meta-dreaming: off")
         if session.background is not None:
             print(f"  · {session.background.status()}")
+        if session.coder is not None:
+            _, detail = session.coder_backend_status()
+            print(f"  · {detail}")
+            print(f"  · {session.coder.status()}")
         if session.routines is not None:
             print(f"  · {session.routines.status()}")
         if config.SYSTEM_SENSE:
@@ -393,6 +466,47 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
             job = session.background.queue(arg)
             print(f"  · queued job {job['id']} — I'll work on it and report back"
                   if job else "  · not queued (queue full, duplicate, or too short)")
+    elif cmd == "code":
+        if session.coder is None:
+            print("  · the code foundry is disabled (JARVS_CODER=0)")
+        elif not arg:
+            print("  · usage: /code <topic>  (e.g. /code a terminal habit tracker)")
+        else:
+            project = session.coder.queue(arg)
+            if project is None:
+                print("  · not queued (queue full, duplicate, or topic too short)")
+            else:
+                print(f"  · build {project['id']} queued — {config.CODER_MODEL} is on it")
+                print(f"    {arg[:100]}")
+    elif cmd == "projects":
+        if session.coder is None:
+            print("  · the code foundry is disabled (JARVS_CODER=0)")
+        else:
+            sub, _, pid = arg.partition(" ")
+            sub, pid = sub.strip().lower(), pid.strip()
+            if sub in ("rm", "open", "tree") and pid:
+                if sub == "rm":
+                    print(f"  · {'removed' if session.coder.remove(pid) else 'no project '+pid}")
+                else:
+                    p = session.coder.get(pid)
+                    print(f"  · {p['path']}" if p and p.get("path")
+                          else f"  · no project {pid}")
+                    if p and sub == "tree":
+                        print(_project_tree(p.get("path", "")))
+            print(f"  · {session.coder.status()}")
+            for p in session.coder.recent(8):
+                mark = {"completed": "✔", "failed": "✗", "running": "⟳",
+                        "queued": "·"}.get(p["status"], "?")
+                line = (f"    [{mark}] {p['id']} · "
+                        f"{p.get('name') or p['topic'][:40]} "
+                        f"({p.get('language') or '?'}, "
+                        f"{len(p.get('files') or [])} files"
+                        f"{', verified' if p.get('verified') else ''})")
+                print(line + (f" — {p['progress']}" if p["status"] == "running" else ""))
+                if p.get("path"):
+                    print(f"        {p['path']}")
+                if p["status"] == "failed" and p.get("error"):
+                    print(f"        ✗ {p['error'][:160]}")
     elif cmd == "jobs":
         if session.background is None:
             print("  · background work is disabled")
@@ -411,8 +525,52 @@ def _handle_command(session: JarvsSession, line: str) -> bool:
     return True
 
 
+def _project_result_line(project_id: str, session: JarvsSession) -> str:
+    """One-line summary of a finished build (files, verdict, where it lives)."""
+    p = session.coder.get(project_id) if session.coder else None
+    if not p:
+        return ""
+    checks = p.get("checks") or {}
+    verdict = ("checks passed" if checks.get("ok")
+               else "checks failing" if checks.get("checks")
+               else "unverified")
+    return (f"{p.get('result') or ''} · {verdict}")
+
+
+def _project_tree(path: str, prefix: str = "        ") -> str:
+    """A short indented file listing for a built project (depth-capped, sorted)."""
+    if not path or not os.path.isdir(path):
+        return f"{prefix}(no directory yet)"
+    lines = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in ("__pycache__", "node_modules", ".git"))
+        rel = os.path.relpath(dirpath, path)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 2:
+            continue
+        indent = prefix + "  " * depth
+        if rel != ".":
+            lines.append(f"{indent}{os.path.basename(dirpath)}/")
+        for fn in sorted(filenames):
+            lines.append(f"{indent}  {fn}")
+    return "\n".join(lines[:40]) + ("\n        …" if len(lines) > 40 else "")
+
+
 def _flush_background(session: JarvsSession) -> None:
-    """Print any background-job / routine events that arrived since the last prompt."""
+    """Print any background-job / routine / build events since the last prompt."""
+    if session.coder is not None:
+        for ev in session.coder.drain_events():
+            if ev["kind"] == "queued":
+                print(f"\n  ⟡ build {ev['id']} queued: {ev['topic'][:70]}")
+            elif ev["kind"] == "completed":
+                print(f"\n  ⟡ build {ev['id']} complete — {ev['name']}")
+                print(f"    {_project_result_line(ev['id'], session)}")
+            elif ev["kind"] == "failed":
+                p = session.coder.get(ev["id"]) or {}
+                print(f"\n  ⟡ build {ev['id']} failed: {ev['topic'][:60]}")
+                if p.get("error"):
+                    print(f"    ✗ {p['error'][:300]}")
     if session.routines is not None:
         for ev in session.routines.drain_events():
             if ev["kind"] == "created":
@@ -444,6 +602,10 @@ def main() -> None:
     print(f"  · {session.memory.status()}")
     if session.background is not None:
         print(f"  · {session.background.status()}")
+    if session.coder is not None:
+        _, detail = session.coder_backend_status()
+        print(f"  · {detail}")
+        print(f"  · {session.coder.status()}")
     if session.routines is not None:
         print(f"  · {session.routines.status()}")
     while True:

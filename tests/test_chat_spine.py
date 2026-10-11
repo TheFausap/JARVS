@@ -72,6 +72,50 @@ class ReplyLoopTests(unittest.TestCase):
             config.SLOT_CTX, config.GEN_RESERVE, config.SAFETY_MARGIN = orig
 
 
+class FoundryDispatchTests(unittest.TestCase):
+    """A build request must reach the foundry — and ordinary chat must not."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from jarvs import config
+        from jarvs.coder import CoderBackend
+
+        self.dir = tempfile.mkdtemp()
+        self._cleanup = lambda: shutil.rmtree(self.dir, ignore_errors=True)
+        self._data, self._complete = config.DATA_DIR, CoderBackend.complete
+        config.DATA_DIR = Path(self.dir)
+        # Any build the worker picks up fails immediately and silently.
+        CoderBackend.complete = lambda self, system, user, max_tokens=None: ""
+        self.session = JarvsSession(speak=False, voice=_SilentVoice())
+
+    def tearDown(self):
+        from jarvs import config
+        from jarvs.coder import CoderBackend
+        config.DATA_DIR = self._data
+        CoderBackend.complete = self._complete
+        self._cleanup()
+
+    def test_build_request_queues_a_project(self):
+        out = self.session._dispatch_background(
+            "build me a CLI habit tracker", "On it, sir.")
+        self.assertEqual(out, "On it, sir.")
+        projects = self.session.coder.list()
+        self.assertEqual(len(projects), 1)
+        self.assertEqual(projects[0]["topic"], "build me a CLI habit tracker")
+
+    def test_ordinary_chat_does_not_build(self):
+        self.session._dispatch_background("what is the cpu load?", "Forty percent.")
+        self.assertEqual(self.session.coder.list(), [])
+
+    def test_code_marker_in_reply_queues(self):
+        out = self.session._dispatch_background("hello", "on it [[CODE: a snake game]]")
+        self.assertEqual(out, "on it")
+        self.assertEqual(self.session.coder.list()[0]["topic"], "a snake game")
+
+
 class _SilentVoice:
     """A no-op stand-in for JarvsVoice so tests never spawn piper/say."""
     enabled = False

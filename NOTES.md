@@ -11,8 +11,9 @@
 
 - **Base model**: `TeichAI/gemma-4-26B-A4B-it-Claude-Opus-Distill-v2-GGUF`, single
   backend. MoE (~4B active → fast), Opus-distilled → strong conversational/persona
-  fit for a JARVIS assistant. Qwen3-Coder dropped for v1; can be added later as a
-  `*_FAST_*` coder backend.
+  fit for a JARVIS assistant. Qwen3-Coder dropped for v1; ~~can be added later as a
+  `*_FAST_*` coder backend~~ → added 2026-10-11 as the foundry's coding specialist
+  (`Qwen3-Coder-Next`, see AGENT CAPABILITIES).
 - **Architecture**: transformer GGUF served over an OpenAI-compatible endpoint
   (llama.cpp). Base model is treated as a FIXED stage0 (JCN3690 philosophy); all
   capability is built as external primitives. RWKV/MAMBA deferred — the endpoint is
@@ -97,6 +98,46 @@ Background/agent-like layer added after the core build:
   asks about the host/time/location, so answers are grounded in real numbers. Web UI:
   `/api/system` + a HOST section (CPU/GPU/RAM/temp), live clock, and location. REPL:
   `/system`. Geolocation is IP-based, not wifi-BSSID (keyless, approximate, opt-out).
+
+- **Autonomous coding — the foundry** (`jarvs/coder.py`, 2026-10-11): give JARVS a
+  TOPIC and it builds a working project on disk, unattended. Pipeline:
+  1. **plan** — one call to the coder model turns the bare topic into a design (name,
+     language, entry point, file list with a purpose each, and the command that proves
+     it works). Scope is deliberately capped at `JARVS_CODER_MAX_FILES` (8): working
+     beats ambitious.
+  2. **write** — every file is generated in full, in design order, with the design and
+     the already-written files in context so the pieces actually agree.
+  3. **verify** — the project is really run: `python -m py_compile` / `node --check`
+     for syntax, then the test command (pytest, node --test, …) inside the project dir.
+  4. **repair** — the failure goes back to the model with the offending file and the
+     raw error; the loop repeats up to `JARVS_CODER_MAX_REPAIRS` (2) times.
+  Each project gets a `JARVS_REPORT.md` (design, files, check output, repair rounds)
+  and lands in memory. Bounded + sandboxed: writes are confined to
+  `JARVS_PROJECTS_DIR` (default `data/projects`) with path traversal rejected;
+  subprocesses come from an allowlist (`python`, `pytest`, `node`, `npm`, `go`, …),
+  run with `shell=False`, a timeout, and no shell metacharacters; `JARVS_CODER_EXEC=0`
+  disarms execution entirely.
+- **Coder model**: `Qwen3-Coder-Next`, reached over the same OpenAI-compatible wire as
+  the base model. `JARVS_CODER_BASE_URL` empty (the default) reuses the base model's
+  server and swaps only the model id; pointing it elsewhere gives the coder its own
+  server, context slot and timeout. If the coder endpoint is unreachable the foundry
+  falls back to the base backend, so a build degrades instead of dying.
+  (This closes the deferred `*_FAST_*` coder backend from the DECISIONS block — the
+  coding specialist is a second model, not a bigger prompt.)
+- **Triggers**: `@/code <topic>` command, or plain language ("build me a habit
+  tracker") detected by `is_code_request` — a build verb aimed at a software object,
+  never on a question ("how would you build a parser?" stays a conversation). The model
+  can also defer a build itself with a `[[CODE: topic]]` marker, mirroring
+  `[[THINK:]]`. Builds run on their own worker thread, off the reply path, like
+  background jobs. REPL: `/code`, `/projects [rm|open|tree <id>]`.
+- **Web UI**: `/api/code` (GET projects / POST a topic), a FORGE widget + project list
+  in the sidebar, and finished builds surface in the transcript as `JARVS · FORGE`.
+  The system head carries a `[AUTONOMOUS CODING]` block so the model says "on it"
+  instead of confabulating files it never wrote — the same anti-confabulation fix the
+  routines layer needed.
+- Foundry tests in `tests/test_coder.py` (parsing, traversal/command sandbox, and the
+  whole plan→write→verify→repair loop against a stubbed coder) + dispatch tests in
+  `tests/test_chat_spine.py`.
 
 # OPEN QUESTIONS
 

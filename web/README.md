@@ -27,7 +27,9 @@ cd ..
 ```
 
 (The backend needs llama-server running on `JARVS_BASE_URL`, default
-`http://127.0.0.1:8080/v1`.)
+`http://127.0.0.1:8080/v1`. The code foundry talks to its own endpoint,
+`JARVS_CODER_BASE_URL` — leave it empty to reuse the base model's server and only
+swap the model id (default `Qwen3-Coder-Next`).)
 
 ## Develop (hot reload)
 
@@ -41,12 +43,20 @@ cd web && npm run dev                 # terminal 2 (UI on :5173, proxies /api)
 
 ## API surface
 
-| Route           | Method | Purpose                                   |
-|-----------------|--------|-------------------------------------------|
-| `/api/status`   | GET    | backend / voice / memory / meta status    |
-| `/api/stats`    | GET    | dashboard metrics (latency, counts, …)    |
-| `/api/voice`    | POST   | `{enabled}` → toggle server-side voice     |
-| `/api/chat`     | POST   | `{message}` → SSE stream of token deltas   |
+| Route           | Method | Purpose                                       |
+|-----------------|--------|-----------------------------------------------|
+| `/api/status`   | GET    | backend / voice / memory / meta / coder status|
+| `/api/stats`    | GET    | dashboard metrics (latency, counts, …)        |
+| `/api/voice`    | POST   | `{enabled}` → toggle server-side voice         |
+| `/api/chat`     | POST   | `{message}` → SSE stream of token deltas       |
+| `/api/jobs`     | GET    | recent background jobs                         |
+| `/api/routines` | GET    | recurring scheduled tasks                      |
+| `/api/code`     | GET    | code foundry: coder backend + recent projects  |
+| `/api/code`     | POST   | `{topic}` → queue an autonomous build          |
+| `/api/system`   | GET    | live host telemetry (CPU/GPU/mem/time/geo)     |
+
+The FORGE panel in the sidebar shows foundry projects; a finished build also lands in
+the transcript as a `JARVS · FORGE` message.
 
 ## Config
 

@@ -4,7 +4,8 @@ import MessageStream from "./components/MessageStream.jsx";
 import DataDashboard from "./components/DataDashboard.jsx";
 import InputTerminal from "./components/InputTerminal.jsx";
 import {
-  getStatus, getStats, getJobs, getSystem, getRoutines, setVoice, streamChat,
+  getStatus, getStats, getJobs, getSystem, getRoutines, getProjects,
+  setVoice, streamChat,
 } from "./lib/api.js";
 
 let _id = 0;
@@ -19,9 +20,12 @@ export default function App() {
   const [jobs, setJobs] = useState([]);
   const [system, setSystem] = useState(null);
   const [routines, setRoutines] = useState([]);
+  const [code, setCode] = useState(null);
   const busyRef = useRef(false);
   const seenDoneRef = useRef(new Set());
   const firstJobsRef = useRef(true);
+  const seenBuiltRef = useRef(new Set());
+  const firstCodeRef = useRef(true);
 
   // Initial status + periodic dashboard / jobs polling.
   useEffect(() => {
@@ -59,6 +63,27 @@ export default function App() {
         .catch(() => {});
       getRoutines()
         .then((d) => alive && d.enabled && setRoutines(d.routines || []))
+        .catch(() => {});
+      // Code foundry: surface finished builds into the transcript as they land.
+      getProjects()
+        .then((d) => {
+          if (!alive || !d.enabled) return;
+          setCode(d);
+          for (const p of d.projects || []) {
+            const done = p.status === "completed" || p.status === "failed";
+            if (!done || seenBuiltRef.current.has(p.id)) continue;
+            seenBuiltRef.current.add(p.id);
+            if (firstCodeRef.current) continue;   // don't replay history on load
+            setMessages((m) => [...m, {
+              id: nextId(), role: "assistant", code: true,
+              text:
+                p.status === "completed"
+                  ? `⟡ Build complete — ${p.name || p.topic}\n\n${p.result || ""}\n\n${p.summary || ""}`
+                  : `⟡ Build failed — ${p.topic}\n\n${p.error || ""}`,
+            }]);
+          }
+          firstCodeRef.current = false;
+        })
         .catch(() => {});
     };
     tick();
@@ -108,7 +133,7 @@ export default function App() {
   return (
     <div className="flex h-full w-full">
       <DataDashboard stats={stats} status={status} jobs={jobs} system={system}
-                     routines={routines} onToggleVoice={toggleVoice} />
+                     routines={routines} code={code} onToggleVoice={toggleVoice} />
 
       <main className="flex min-w-0 flex-1 flex-col">
         {/* header: the central status ring */}

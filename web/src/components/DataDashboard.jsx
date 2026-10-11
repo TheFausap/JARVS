@@ -1,7 +1,7 @@
 import { motion } from "framer-motion";
 import {
   Activity, Cpu, MemoryStick, Thermometer, Gauge, BrainCircuit, ListChecks,
-  Volume2, VolumeX, Radio, MapPin, Clock, Repeat,
+  Volume2, VolumeX, Radio, MapPin, Clock, Repeat, Hammer,
 } from "lucide-react";
 
 function nextIn(nextRun) {
@@ -14,6 +14,12 @@ function nextIn(nextRun) {
 const JOB_DOT = {
   queued: "#8a94a3", running: "#00d4ff", completed: "#3ddc97", failed: "#e5484d",
 };
+
+const CODE_DOT = {
+  queued: "#8a94a3", running: "#00d4ff", completed: "#3ddc97", failed: "#e5484d",
+};
+
+const CODE_GLYPH = { queued: "·", running: "⟳", completed: "✔", failed: "✗" };
 
 function Widget({ icon: Icon, label, value, unit, accent }) {
   return (
@@ -45,11 +51,16 @@ function SectionLabel({ children }) {
 
 const dash = (v) => (v === null || v === undefined ? "—" : v);
 
-export default function DataDashboard({ stats, status, jobs = [], system, routines = [], onToggleVoice }) {
+export default function DataDashboard({
+  stats, status, jobs = [], system, routines = [], code, onToggleVoice,
+}) {
   const online = status?.backend_ok;
   const voiceOn = stats?.voice_enabled ?? status?.voice_enabled;
   const jobCounts = stats?.jobs || {};
   const activeJobs = (jobCounts.queued || 0) + (jobCounts.running || 0);
+  const codeCounts = stats?.code || {};
+  const building = (codeCounts.queued || 0) + (codeCounts.running || 0);
+  const projects = code?.projects || [];
 
   const cpu = system?.cpu || {};
   const mem = system?.memory || {};
@@ -99,9 +110,55 @@ export default function DataDashboard({ stats, status, jobs = [], system, routin
           <Widget icon={Activity} label="LATENCY" value={dash(stats?.latency_ms)} unit="ms" accent />
           <Widget icon={BrainCircuit} label="FOCUS" value={dash(stats?.focus_promoted)} />
           <Widget icon={ListChecks} label="JOBS" value={activeJobs} accent={activeJobs > 0} />
-          <Widget icon={Activity} label="TURNS" value={dash(stats?.turns)} />
+          <Widget icon={Hammer} label="FORGE" value={building} accent={building > 0} />
         </div>
       </div>
+
+      {/* code foundry: projects built from a topic */}
+      {code?.enabled && projects.length > 0 && (
+        <div className="hairline rounded-md bg-[#0e0f12]/70 px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Hammer size={12} color="#00d4ff" strokeWidth={1.5} />
+              <SectionLabel>FORGE</SectionLabel>
+            </div>
+            <span className="font-mono text-[9px] text-slate-600 truncate max-w-[6rem]">
+              {code.model}
+            </span>
+          </div>
+          <div className="mt-2 flex flex-col gap-2">
+            {projects.slice(0, 5).map((p) => (
+              <div key={p.id} className="flex items-start gap-2">
+                <span
+                  className="mt-[3px] font-mono text-[9px] leading-none"
+                  style={{
+                    color: CODE_DOT[p.status] || "#8a94a3",
+                    textShadow: p.status === "running" ? "0 0 6px #00d4ff" : "none",
+                  }}
+                >
+                  {CODE_GLYPH[p.status] || "·"}
+                </span>
+                <div className="flex min-w-0 flex-col">
+                  <span className="font-mono text-[10px] leading-snug text-slate-300 break-words">
+                    {p.name || p.topic}
+                  </span>
+                  <span className="font-mono text-[9px] text-slate-600">
+                    {p.status === "running"
+                      ? p.progress || "building…"
+                      : [
+                          p.language,
+                          `${(p.files || []).length} file${(p.files || []).length === 1 ? "" : "s"}`,
+                          p.verified ? "verified" : "unverified",
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* recurring routines */}
       {routines.length > 0 && (
