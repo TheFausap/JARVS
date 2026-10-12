@@ -11,8 +11,12 @@ Routes:
     GET  /static/<path>    static assets (app.jsx, styles.css, vendored libs)
     GET  /api/status       backend / voice / memory / meta-dreaming status
     GET  /api/stats        lightweight dashboard metrics (latency, counts, …)
+    GET  /api/jobs         recent background jobs
+    GET  /api/routines     recurring scheduled tasks
+    GET  /api/code         code foundry: coder backend + recent projects
     POST /api/voice        {"enabled": bool} -> toggle server-side voice
     POST /api/chat         {"message": str}  -> SSE stream of token deltas + done
+    POST /api/code         {"topic": str}    -> queue an autonomous build
 
 Run:  python -m jarvs.server   (then open http://127.0.0.1:8765)
 """
@@ -109,6 +113,9 @@ class JarvsHandler(BaseHTTPRequestHandler):
             "voice": self.session.voice.status(),
             "voice_enabled": self.session.voice.enabled,
             "memory": self.session.memory.stats(),
+            "coder_model": config.CODER_MODEL if self.session.coder else None,
+            "coder_ok": (self.session.coder_backend_status()[0]
+                         if self.session.coder else False),
             "meta": {"promoted": meta["promoted_areas"],
                      "total": meta["total_areas"],
                      "pending": meta["pending_lines"]} if meta else None,
@@ -134,12 +141,21 @@ class JarvsHandler(BaseHTTPRequestHandler):
             "jobs": (self.session.background.counts()
                      if self.session.background else
                      {"queued": 0, "running": 0, "completed": 0, "failed": 0}),
+            "code": (self.session.coder.counts() if self.session.coder else
+                     {"queued": 0, "running": 0, "completed": 0, "failed": 0}),
         }
 
     def _jobs_payload(self) -> dict:
         if self.session.background is None:
             return {"enabled": False, "jobs": []}
         return {"enabled": True, "jobs": self.session.background.recent(12)}
+
+    def _code_payload(self) -> dict:
+        if self.session.coder is None:
+            return {"enabled": False, "projects": []}
+        ok, detail = self.session.coder_backend_status()
+        return {"enabled": True, "backend_ok": ok, "backend_detail": detail,
+                "model": config.CODER_MODEL, "projects": self.session.coder.recent(12)}
 
     def _routines_payload(self) -> dict:
         if self.session.routines is None:
@@ -173,6 +189,8 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._send_json(self._system_payload())
         elif route == "/api/routines":
             self._send_json(self._routines_payload())
+        elif route == "/api/code":
+            self._send_json(self._code_payload())
         elif route == "/api/claude":
             self._send_json(self._claude_payload())
         elif route.startswith("/api/"):
@@ -213,8 +231,26 @@ class JarvsHandler(BaseHTTPRequestHandler):
             self._routine_action()
         elif route == "/api/chat":
             self._stream_chat()
+        elif route == "/api/code":
+            self._queue_build()
         else:
             self.send_error(404, "Not found")
+
+    def _queue_build(self):
+        """POST {"topic": "..."} -> hand a build to the foundry (off the request)."""
+        if self.session.coder is None:
+            self._send_json({"error": "the code foundry is disabled"}, status=503)
+            return
+        topic = (self._read_json().get("topic") or "").strip()
+        if not topic:
+            self._send_json({"error": "empty topic"}, status=400)
+            return
+        project = self.session.coder.queue(topic)
+        if project is None:
+            self._send_json({"error": "not queued (queue full, duplicate, or topic "
+                                      "too short)"}, status=429)
+            return
+        self._send_json({"ok": True, "project": project})
 
     def _routine_action(self):
         """Panel controls: {action: pause|resume|run|remove, id}."""
@@ -300,6 +336,10 @@ def serve(host: str = "", port: int = 0) -> None:
     print(f"  · {detail}")
     print(f"  · {JarvsHandler.session.voice.status()}")
     print(f"  · {JarvsHandler.session.memory.status()}")
+    if JarvsHandler.session.coder is not None:
+        _, detail = JarvsHandler.session.coder_backend_status()
+        print(f"  · {detail}")
+        print(f"  · {JarvsHandler.session.coder.status()}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

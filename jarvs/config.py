@@ -134,6 +134,51 @@ BACKGROUND_RETRY_BACKOFF = _int("JARVS_BACKGROUND_RETRY_BACKOFF", 3, floor=0)
 BACKGROUND_CONTEXT_CHARS = _int("JARVS_BACKGROUND_CONTEXT_CHARS", 6000, floor=500)
 
 
+# --- autonomous coding (the foundry) ------------------------------------------ #
+# A SECOND, specialist backend for code: Qwen3-Coder-Next over the same
+# OpenAI-compatible wire protocol. Leaving JARVS_CODER_BASE_URL empty reuses the
+# base model's endpoint and swaps only the model id; pointing it elsewhere gives the
+# coder its own server (and therefore its own context slot and timeout budget).
+# When the coder endpoint is unreachable the foundry falls back to the base backend
+# so a build request degrades to a slower coder instead of failing outright.
+CODER_ENABLED = _flag("JARVS_CODER", True)
+CODER_BASE_URL = _env("JARVS_CODER_BASE_URL", "")
+CODER_MODEL = _env("JARVS_CODER_MODEL", "Qwen3-Coder-Next")
+CODER_API_KEY = _env("JARVS_CODER_API_KEY", "")
+CODER_TIMEOUT = _int("JARVS_CODER_TIMEOUT", 600, floor=30)
+# Code files are long; the reserve that bounds a chat reply would truncate them.
+CODER_MAX_TOKENS = _int("JARVS_CODER_MAX_TOKENS", 8192, floor=1024)
+CODER_TEMPERATURE = float(_env("JARVS_CODER_TEMPERATURE", "0.2") or "0.2")
+PROJECTS_DIR = Path(_env("JARVS_PROJECTS_DIR", str(DATA_DIR / "projects")))
+
+# Bounds on one build: how much it may write and how hard it may try to fix itself.
+CODER_MAX_FILES = _int("JARVS_CODER_MAX_FILES", 8, floor=1)
+CODER_MAX_FILE_CHARS = _int("JARVS_CODER_MAX_FILE_CHARS", 60000, floor=2000)
+CODER_MAX_REPAIRS = _int("JARVS_CODER_MAX_REPAIRS", 2, floor=0)
+CODER_MAX_FIXES = _int("JARVS_CODER_MAX_FIXES", 3, floor=1)
+CODER_MAX_PENDING = _int("JARVS_CODER_MAX_PENDING", 2, floor=1)
+
+# Verification: run the project's own checks after writing it. JARVS_CODER_EXEC=0
+# disables all subprocess execution (the foundry then only writes files).
+CODER_EXEC = _flag("JARVS_CODER_EXEC", True)
+CODER_TEST_TIMEOUT = _int("JARVS_CODER_TEST_TIMEOUT", 180, floor=10)
+
+# --- the duet: Qwen and Claude coding together -------------------------------- #
+# When the Claude bridge is ON, a foundry build stops being Qwen alone and becomes a
+# bounded dialogue: Qwen3-Coder-Next plans, writes and repairs (local, unlimited),
+# while Claude reviews the design, diagnoses stubborn failures, and critiques the
+# finished project — read-only, through the bridge's own gates and token ledger.
+# Cheap local tokens do the bulk; expensive Claude tokens go where they change the
+# outcome. Off (or bridge off) => Qwen builds alone, exactly as before.
+CODER_COLLAB = _flag("JARVS_CODER_COLLAB", True)
+# How many Claude consultations ONE build may spend (plan review, failure diagnosis
+# and the final critique all draw on this budget).
+CODER_COLLAB_ROUNDS = _int("JARVS_CODER_COLLAB_ROUNDS", 2, floor=0)
+# Review the design BEFORE a file is written — the cheapest possible moment to be
+# told the plan won't work.
+CODER_COLLAB_PLAN = _flag("JARVS_CODER_COLLAB_PLAN", True)
+
+
 # --- routines (recurring scheduled tasks) ------------------------------------- #
 
 ROUTINES_ENABLED = _flag("JARVS_ROUTINES", True)
@@ -197,6 +242,9 @@ def summary() -> dict:
     return {
         "base_url": BASE_URL,
         "model": MODEL,
+        "coder_base_url": CODER_BASE_URL or BASE_URL,
+        "coder_model": CODER_MODEL,
+        "projects_dir": str(PROJECTS_DIR),
         "embed_model": EMBED_MODEL,
         "tts_backend": TTS_BACKEND,
         "data_dir": str(DATA_DIR),

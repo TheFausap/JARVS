@@ -6,11 +6,24 @@ import MemoryPanel from "./components/MemoryPanel.jsx";
 import InputTerminal from "./components/InputTerminal.jsx";
 import {
   getStatus, getStats, getJobs, getSystem, getRoutines, getClaude, routineAction,
+  getProjects,
   setVoice, streamChat,
 } from "./lib/api.js";
 
+// Read a peer-reviewed build as a collaboration: one line per Claude turn.
+function duetLine(p) {
+  const turns = (p.collab || []).filter((t) => t.role === "peer");
+  if (!turns.length) return "";
+  const lines = turns.map((t) => {
+    const head = (t.text || "").trim().split("\n")[0] || "";
+    return `⟡ Claude · ${t.kind}: ${head.slice(0, 110)}`;
+  });
+  return `\n\n${lines.join("\n")}`;
+}
+
 // How a finished Claude exchange reads when surfaced into the transcript.
 const CLAUDE_LINE = {
+  ok: "advised",
   done: "completed",
   needs_clarification: "needs clarification",
   reject: "was declined by Claude",
@@ -33,11 +46,14 @@ export default function App() {
   const [system, setSystem] = useState(null);
   const [routines, setRoutines] = useState([]);
   const [claude, setClaude] = useState(null);
+  const [code, setCode] = useState(null);
   const busyRef = useRef(false);
   const seenDoneRef = useRef(new Set());
   const firstJobsRef = useRef(true);
   const seenClaudeRef = useRef(new Set());
   const firstClaudeRef = useRef(true);
+  const seenBuiltRef = useRef(new Set());
+  const firstCodeRef = useRef(true);
 
   // Initial status + periodic dashboard / jobs polling.
   useEffect(() => {
@@ -97,6 +113,27 @@ export default function App() {
           firstClaudeRef.current = false;
         })
         .catch(() => {});
+      // Code foundry: surface finished builds into the transcript as they land.
+      getProjects()
+        .then((d) => {
+          if (!alive || !d.enabled) return;
+          setCode(d);
+          for (const p of d.projects || []) {
+            const done = p.status === "completed" || p.status === "failed";
+            if (!done || seenBuiltRef.current.has(p.id)) continue;
+            seenBuiltRef.current.add(p.id);
+            if (firstCodeRef.current) continue;   // don't replay history on load
+            setMessages((m) => [...m, {
+              id: nextId(), role: "assistant", code: true,
+              text:
+                p.status === "completed"
+                  ? `⟡ Build complete — ${p.name || p.topic}\n\n${p.result || ""}\n\n${p.summary || ""}${duetLine(p)}`
+                  : `⟡ Build failed — ${p.topic}\n\n${p.error || ""}`,
+            }]);
+          }
+          firstCodeRef.current = false;
+        })
+        .catch(() => {});
     };
     tick();
     const h = setInterval(tick, 3000);
@@ -152,7 +189,8 @@ export default function App() {
   return (
     <div className="flex h-full w-full">
       <DataDashboard stats={stats} status={status} jobs={jobs} system={system}
-                     routines={routines} claude={claude} onRoutineAction={onRoutineAction}
+                     routines={routines} claude={claude} code={code}
+                     onRoutineAction={onRoutineAction}
                      onToggleVoice={toggleVoice} />
 
       <main className="flex min-w-0 flex-1 flex-col">

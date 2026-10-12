@@ -14,7 +14,8 @@ one calm, precise persona. It talks to an OpenAI-compatible local LLM backend
 (llama.cpp serving a GGUF model) for its raw language and reasoning, and wraps that base
 model in external components that give it durable memory, self-critique, a sense of its
 host and surroundings, autonomous background work, scheduled routines, voice output, a
-web UI, and the ability to delegate coding to Claude Code. Replies can be spoken aloud,
+web UI, the ability to build software itself from a topic, and the ability to delegate
+coding to Claude Code. Replies can be spoken aloud,
 so JARVS writes clean prose by default.
 
 ## The fixed-stage0 philosophy
@@ -39,7 +40,8 @@ token counting); `chat.py` holds `JarvsSession`, the reply spine; `memory.py` pl
 `meta_dreaming.py` are self-critique and its refinement; `background.py` runs deferred
 work; `routines.py` runs recurring scheduled tasks; `system_sense.py` reads host
 telemetry; `voice.py` speaks; `web_access.py` does optional live web search;
-`claude_bridge.py` delegates coding to Claude Code; `server.py` serves the web UI; and
+`claude_bridge.py` delegates coding to Claude Code; `coder.py` is the code foundry that
+builds projects itself; `server.py` serves the web UI; and
 `self_model.py` (this dossier's reader) is JARVS's model of its own architecture.
 
 ## The reply pipeline
@@ -124,6 +126,37 @@ is approached and refuses past it. Every outcome — JARVS's own missteps and Cl
 observations — is distilled back into memory, so JARVS learns from the exchanges. It is
 off by default.
 
+## The code foundry
+
+JARVS can also build software *itself*, from nothing but a topic, through
+`coder.py`. A dedicated coding model (`Qwen3-Coder-Next`, reached over the same
+OpenAI-compatible wire as the base model — its own server if configured, otherwise the
+base server with the model id swapped) plans a small runnable design, writes every file
+in full, runs the project's own checks, and feeds any failure back to the model to
+repair, for a bounded number of rounds. Projects land in a projects directory with a
+report of the design, the files and the check output. The work is sandboxed: writes
+cannot escape the projects directory, only an allowlist of interpreters may be executed,
+never through a shell, and execution can be switched off entirely. Two coding paths
+therefore coexist, and when the bridge is on they work together as a duet.
+
+The duet: Qwen3-Coder-Next plans, writes and repairs the project — local tokens, no
+meter — while Claude is consulted read-only at the three moments where a second opinion
+changes the outcome. It reviews the design *before any file is written*; if the local
+repairs cannot fix a failure, it reads the project directory and diagnoses the root
+cause, which becomes Qwen's repair brief; and once the project passes, it gets one final
+critique, which is acted on only if it names something concrete and is **rolled back if
+the change breaks the checks**. A build may spend only a fixed number of these
+consultations, and every one goes through the same gates and token ledger as a
+delegation — the difference is that Claude is never offered write access and is scoped
+to the project under discussion rather than JARVS's own tree. With the bridge off, the
+foundry builds alone and nothing else changes.
+
+Routing keeps their territories distinct: an explicit Claude delegation (the user named
+Claude) stays with the bridge, because that is about the user's existing tree; a build
+request goes to the foundry — solo or as a duet; and any other code task with the bridge
+on goes to the bridge. Work on code that already exists (a named file, "the parser", a
+maintenance verb) is never hijacked into a greenfield project.
+
 ## Voice and the web UI
 
 `voice.py` (`JarvsVoice`) speaks replies via Piper TTS (falling back to the system `say`
@@ -131,7 +164,7 @@ or silence). `server.py` is a small standard-library HTTP + SSE server that wrap
 single `JarvsSession` and serves a React/Vite single-page app (a minimalist command
 centre: a status ring, a message stream, a live dashboard of host and internal
 telemetry, and a command bar). The dashboard surfaces memory counts, background jobs,
-routines, and the Claude bridge's token meter and exchange history.
+routines, foundry projects, and the Claude bridge's token meter and exchange history.
 
 ## This self-model
 

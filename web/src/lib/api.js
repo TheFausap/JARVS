@@ -38,11 +38,28 @@ export async function getClaude() {
   return r.json();
 }
 
+export async function getProjects() {
+  const r = await fetch("/api/code");
+  if (!r.ok) throw new Error(`status ${r.status}`);
+  return r.json();
+}
+
 export async function routineAction(action, id) {
   const r = await fetch("/api/routines", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, id }),
+  });
+  return r.json();
+}
+
+// Hand a topic to the code foundry. Resolves as soon as the build is QUEUED —
+// the project is built on a worker thread and shows up via getProjects().
+export async function queueCode(topic) {
+  const r = await fetch("/api/code", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ topic }),
   });
   return r.json();
 }
