@@ -9,7 +9,7 @@
 
 # DECISIONS (2026-10-06)
 
-- **Base model**: `TeichAI/gemma-4-26B-A4B-it-Claude-Opus-Distill-v2-GGUF`, single
+- **Base model**: `DavidAU/Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF`, single
   backend. MoE (~4B active → fast), Opus-distilled → strong conversational/persona
   fit for a JARVIS assistant. Qwen3-Coder dropped for v1; ~~can be added later as a
   `*_FAST_*` coder backend~~ → added 2026-10-11 as the foundry's coding specialist

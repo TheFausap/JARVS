@@ -27,7 +27,7 @@ cd ..
 ```
 
 (The backend needs llama-server running on `JARVS_BASE_URL`, default
-`http://127.0.0.1:8080/v1`. The code foundry talks to its own endpoint,
+`http://192.168.100.248:8081/v1`. The code foundry talks to its own endpoint,
 `JARVS_CODER_BASE_URL` — leave it empty to reuse the base model's server and only
 swap the model id (default `Qwen3-Coder-Next`).)
 

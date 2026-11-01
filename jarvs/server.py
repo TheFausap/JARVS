@@ -119,6 +119,7 @@ class JarvsHandler(BaseHTTPRequestHandler):
             "meta": {"promoted": meta["promoted_areas"],
                      "total": meta["total_areas"],
                      "pending": meta["pending_lines"]} if meta else None,
+            "reason": client.saved_reason_state(),
             "turns": self.metrics.turns,
         }
 

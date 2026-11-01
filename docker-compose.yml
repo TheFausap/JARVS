@@ -1,0 +1,41 @@
+services:
+  jarvs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jarvs:latest
+    container_name: jarvs
+    restart: unless-stopped
+    ports:
+      - "${JARVS_WEB_PORT:-8765}:8765"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      JARVS_WEB_HOST: "0.0.0.0"
+      JARVS_WEB_PORT: "8765"
+      JARVS_BASE_URL: "${JARVS_BASE_URL:-http://192.168.100.248:8081/v1}"
+      JARVS_MODEL: "${JARVS_MODEL:-DavidAU/Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF}"
+      JARVS_API_KEY: "${JARVS_API_KEY:-sk-no-key-required}"
+      JARVS_TTS_BACKEND: "${JARVS_TTS_BACKEND:-auto}"
+      TZ: "${TZ:-Europe/Warsaw}"
+    extra_hosts:
+      # Allows JARVS_BASE_URL=http://host.docker.internal:8081/v1 when llama-server runs on the Docker host
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./voices:/app/voices:ro
+      - ./self:/app/self:ro
+    # --- Optional: Linux host audio passthrough for Piper TTS (`aplay` / `paplay`) ---
+    # devices:
+    #   - /dev/snd:/dev/snd
+    # group_add:
+    #   - audio
+    # --- Optional: NVIDIA GPU passthrough (for `nvidia-smi` telemetry in system_sense) ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

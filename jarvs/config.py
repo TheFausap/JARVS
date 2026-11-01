@@ -28,10 +28,19 @@ def _env(name: str, default: str = "") -> str:
 # different architecture) means pointing these at a different endpoint, nothing
 # more. The default model id matches the DECISIONS block in NOTES.md.
 
-BASE_URL = _env("JARVS_BASE_URL", "http://127.0.0.1:8080/v1")
+def _normalize_base_url(raw: str) -> str:
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return "http://192.168.100.248:8081/v1"
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+    return url
+
+
+BASE_URL = _normalize_base_url(_env("JARVS_BASE_URL", "http://192.168.100.248:8081/v1"))
 MODEL = _env(
     "JARVS_MODEL",
-    "TeichAI/gemma-4-26B-A4B-it-Claude-Opus-Distill-v2-GGUF",
+    "DavidAU/Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF",
 )
 API_KEY = _env("JARVS_API_KEY", "sk-no-key-required")  # llama.cpp ignores it
 
@@ -70,6 +79,25 @@ SAFETY_MARGIN = _int("JARVS_CTX_SAFETY_MARGIN", 1024, floor=0)
 
 # Sampling defaults.
 TEMPERATURE = float(_env("JARVS_TEMPERATURE", "0.7") or "0.7")
+
+# --- DavidAU Turbo-Brilliance / {REASON:...} cognitive routing ---------------- #
+
+REASON_TAGS = _env("JARVS_REASON_TAGS", "auto")   # auto | on | off
+REASON_PRESET = _env("JARVS_REASON_PRESET", "default")
+REASON_TAG_MAIN = _env("JARVS_REASON_TAG_MAIN", "")
+REASON_TAG_BACKGROUND = _env("JARVS_REASON_TAG_BACKGROUND", "")
+REASON_TAG_CRITIC = _env("JARVS_REASON_TAG_CRITIC", "")
+REASON_TAG_DREAM = _env("JARVS_REASON_TAG_DREAM", "")
+REASON_TAG_CLAUDE = _env("JARVS_REASON_TAG_CLAUDE", "")
+REASON_TAG_ROUTER = _env("JARVS_REASON_TAG_ROUTER", "")
+REASON_TAG_OFF = _env("JARVS_REASON_TAG_OFF", "")
+CACHE_PROMPT = _env("JARVS_CACHE_PROMPT", "auto")  # auto | on | off
+REASON_PANEL_DETAIL = _flag("JARVS_REASON_PANEL_DETAIL", False)
+CONSTRUCT = _env("JARVS_CONSTRUCT", "").lower()
+CONSTRUCT_BLEND = _flag("JARVS_CONSTRUCT_BLEND", True)
+CONSTRUCT_INSTRUCT = _flag("JARVS_CONSTRUCT_INSTRUCT", False)
+HOLODECK = _flag("JARVS_HOLODECK", False)
+HOLODECK_INSTRUCT = _flag("JARVS_HOLODECK_INSTRUCT", False)
 
 
 # --- external memory ---------------------------------------------------------- #

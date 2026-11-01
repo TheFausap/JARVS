@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python virtualenvs & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / frontend build artifacts (rebuilt in stage 1)
+web/node_modules/
+web/dist/
+jarvs/web_dist/
+
+# Runtime data & large voice models (mounted as volumes at runtime)
+data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.jsonl
+voices/*.onnx
+voices/*.onnx.json
+
+# Local environment overrides
+.env
+*.local

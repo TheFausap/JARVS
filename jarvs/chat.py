@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 
-from . import client, config, system_sense, web_access
+from . import client, config, system_sense, turbo_brilliance, web_access
 from .background import BackgroundManager, should_auto_queue, extract_think_markers
 from .claude_bridge import ClaudeBridge, is_code_request as is_claude_request
 from .rules import RulesStore, is_rule_request, implies_web_verify
@@ -42,6 +42,7 @@ _NAMES_CLAUDE_RE = re.compile(r"\bclaude\b", re.I)
 # The persona head. JARVS is a calm, precise, lightly wry assistant — competent and
 # unhurried, never obsequious. Kept short on purpose: durable behaviour will come
 # from the external stack (memory, consolidated adaptations), not a bloated prompt.
+
 DEFAULT_SYSTEM = (
     "You are JARVS, a personal AI assistant in the vein of JARVIS: calm, precise, "
     "and quietly witty. You address the user respectfully and get to the point. "
@@ -90,10 +91,11 @@ class JarvsSession:
         self.history: list[dict] = []          # [{"role": "...", "content": "..."}]
         self.voice = voice if voice is not None else JarvsVoice(log=self._log)
         self.speak = speak
+        client.load_reason_state()
         # External memory: durable across sessions, degradable to a no-op. The dream
-        # pass borrows the bookkeeping generate(system, user) path.
+        # pass borrows the bookkeeping generate(system, user) path routed to "dream".
         self.memory = memory if memory is not None else Memory(
-            generate_fn=lambda s, u: client.generate(s, u, reason=False))
+            generate_fn=lambda s, u: client.generate(s, u, reason=False, task="dream"))
 
         # Self-critique + meta-dreaming. The session id is the diversity axis
         # meta-dreaming promotes across, so one conversation can't reshape the critic.
@@ -104,7 +106,7 @@ class JarvsSession:
             self.meta_dreamer = MetaDreamer(
                 log_path=os.path.join(str(config.DATA_DIR), "critique_log.jsonl"),
                 store_path=os.path.join(str(config.DATA_DIR), "meta_focus.json"),
-                generate_fn=client.generate,
+                generate_fn=lambda s, u, r=False: client.generate(s, u, reason=r, task="dream"),
                 known_names=("jarvs",),
                 promote_min_pairs=config.METADREAM_PROMOTE,
                 distill_min_new=config.METADREAM_MIN_NEW)
@@ -113,14 +115,14 @@ class JarvsSession:
             self.critic = Critic(
                 log_path=os.path.join(str(config.DATA_DIR), "critique_log.jsonl"),
                 session_id=self.session_id,
-                generate_fn=client.generate,
+                generate_fn=lambda s, u, r=False: client.generate(s, u, reason=r, task="critic"),
                 focus_fn=focus_fn)
 
         # Autonomous background work (deferred tasks + optional web research).
         self.background: BackgroundManager | None = None
         if config.BACKGROUND_ENABLED:
             self.background = BackgroundManager(
-                generate_fn=client.generate,
+                generate_fn=lambda s, u, r=True: client.generate(s, u, reason=r, task="background"),
                 store_path=os.path.join(str(config.DATA_DIR), "background_jobs.json"),
                 persona=self.system,
                 memory_fn=lambda t: self.memory.remember_fact(t, source="background"))
@@ -132,7 +134,7 @@ class JarvsSession:
             self.routines = RoutineScheduler(
                 background=self.background,
                 store_path=os.path.join(str(config.DATA_DIR), "routines.json"),
-                generate_fn=client.generate)
+                generate_fn=lambda s, u, r=False: client.generate(s, u, reason=r, task="router"))
             self.routines.start()
 
         # Governed conduit for delegating coding to Claude Code (off by default).
@@ -140,7 +142,7 @@ class JarvsSession:
         self.claude_bridge: ClaudeBridge | None = None
         if config.CLAUDE_BRIDGE_ENABLED:
             self.claude_bridge = ClaudeBridge(
-                generate_fn=client.generate,
+                generate_fn=lambda s, u, r=False: client.generate(s, u, reason=r, task="claude"),
                 ledger_path=os.path.join(str(config.DATA_DIR), "claude_ledger.json"),
                 exchanges_path=os.path.join(str(config.DATA_DIR),
                                             "claude_exchanges.json"),
@@ -257,11 +259,35 @@ class JarvsSession:
 
     # -- the reply path -------------------------------------------------------- #
 
-    def build_system(self, user_input: str) -> str:
+    def build_system(self, user_input: str, *, turn_reason_tag: str = "") -> str:
         """Assemble the system head for this turn: the persona plus any relevant
         recollections. (Meta-dreaming's focus directive goes to the CRITIC's prompt,
         not here — it sharpens how replies are judged, not how they are written.)"""
         head = self.system
+        if client.HOLODECK_ON:
+            head += "\n\n" + turbo_brilliance.build_holodeck_directive()
+        elif client.ACTIVE_CONSTRUCT:
+            head += "\n\n" + turbo_brilliance.build_construct_directive(
+                client.ACTIVE_CONSTRUCT,
+                blend=client.CONSTRUCT_BLEND,
+                has_history=len(self.history) > 1,
+                teacher_instruction=client.TEACHER_CONSTRUCT_INSTRUCTION,
+            )
+        active_tag = ""
+        if client.REASON_TAGS_ON or client.ACTIVE_CONSTRUCT or client.HOLODECK_ON or turn_reason_tag:
+            active_tag = client.reason_tag_for_task(
+                task="main",
+                reason=config.THINKING_ENABLED,
+                reason_tag=turn_reason_tag or None,
+            )
+        if active_tag:
+            framing = turbo_brilliance.build_assistant_turn_framing(
+                active_tag,
+                pure_construct=client.is_pure_construct_or_holodeck(),
+                panel_detail=client.REASON_PANEL_DETAIL,
+            )
+            if framing:
+                head += "\n\n" + framing
         recall = self.memory.recall_block(user_input)
         if recall:
             head += "\n\n" + recall
@@ -318,7 +344,10 @@ class JarvsSession:
         """Distil ``query`` into clean search terms, run a live web search, and render a
         ``[WEB]`` block (or "" if unavailable/empty). Best-effort — never raises into the
         reply path."""
-        search_q = distill_search_query(query, client.generate)
+        search_q = distill_search_query(
+            query,
+            lambda s, u, r=False: client.generate(s, u, reason=r, task="router"),
+        )
         try:
             results = web_access.web_search(search_q,
                                             max_results=config.WEB_REPLY_RESULTS)
@@ -339,9 +368,18 @@ class JarvsSession:
         user_input = (user_input or "").strip()
         if not user_input:
             return ""
+        inline_tag, cleaned_input = turbo_brilliance.extract_inline_reason_tag(user_input)
+        if inline_tag and cleaned_input:
+            user_input = cleaned_input
         self.history.append({"role": "user", "content": user_input})
         messages = self._fit_history()
-        reply = client.generate_with_history(self.build_system(user_input), messages)
+        system_head = self.build_system(user_input, turn_reason_tag=inline_tag)
+        if inline_tag:
+            reply = client.generate_with_history(
+                system_head, messages, reason_tag=inline_tag
+            )
+        else:
+            reply = client.generate_with_history(system_head, messages)
         if not reply:
             reply = (f"[backend error] {client.LAST_GENERATION_ERROR}"
                      if client.LAST_GENERATION_ERROR else "[no reply]")
@@ -448,7 +486,9 @@ class JarvsSession:
         previous reply). Runs on a daemon thread; best-effort."""
         try:
             remember_from_request(
-                user_input, history, client.generate,
+                user_input,
+                history,
+                lambda s, u, r=False: client.generate(s, u, reason=r, task="router"),
                 lambda t: self.memory.remember_fact(t, source="user"))
         except Exception:  # noqa: BLE001
             pass
@@ -463,7 +503,7 @@ class JarvsSession:
             directive = client.generate(
                 "Rewrite the user's instruction as ONE concise standing rule for an "
                 "assistant to follow, imperative voice, at most 30 words. Output only "
-                "the rule.", user_input, False).strip()
+                "the rule.", user_input, False, task="router").strip()
             directive = " ".join(directive.split())[:400] or user_input
             self.rules.add(directive)
             if implies_web_verify(user_input) or implies_web_verify(directive):
@@ -505,19 +545,26 @@ class JarvsSession:
         user_input = (user_input or "").strip()
         if not user_input:
             return
+        inline_tag, cleaned_input = turbo_brilliance.extract_inline_reason_tag(user_input)
+        if inline_tag and cleaned_input:
+            user_input = cleaned_input
         self.history.append({"role": "user", "content": user_input})
         messages = self._fit_history()
-        full = [{"role": "system", "content": self.build_system(user_input)}] + messages
+        system_head = self.build_system(user_input, turn_reason_tag=inline_tag)
+        full = [{"role": "system", "content": system_head}] + messages
         parts: list[str] = []
         client.LAST_GENERATION_ERROR = ""
         try:
-            for delta in client.stream_chat(full):
+            stream_kwargs = {"reason_tag": inline_tag} if inline_tag else {}
+            for delta in client.stream_chat(full, **stream_kwargs):
                 parts.append(delta)
                 yield delta
         except Exception as e:  # noqa: BLE001
             client.LAST_GENERATION_ERROR = f"{type(e).__name__}: {e}"
             return
         reply = client.strip_reasoning("".join(parts)).strip()
+        if not client.is_pure_construct_or_holodeck():
+            reply = turbo_brilliance.strip_construct_borders(reply)
         if not reply:
             client.LAST_GENERATION_ERROR = (client.LAST_GENERATION_ERROR
                                             or "empty reply")
@@ -552,6 +599,10 @@ class JarvsSession:
 _BANNER = "JARVS online. Type a message, or /help for commands."
 _HELP = (
     "/voice [on|off]      toggle or set voice output\n"
+    "/think [on|off]      toggle or set reasoning (<think> scratchpad)\n"
+    "/reason [...]        Turbo-Brilliance cognitive modes, presets & cache policy\n"
+    "/construct [...]     activate or blend a 27D AI Construct (e.g. stark, coder, pkd)\n"
+    "/holodeck [on|off]   toggle Star Trek Holodeck multi-character simulation\n"
     "/remember <fact>     store a durable semantic fact\n"
     "/memory              memory stats\n"
     "/dream               weave associative links across stored memories\n"
@@ -572,6 +623,233 @@ _HELP = (
     "/help                this list\n"
     "/quit, /exit         leave"
 )
+
+
+def _format_reason_status() -> str:
+    construct_str = "none"
+    if client.ACTIVE_CONSTRUCT:
+        kind = "instruct" if client.CONSTRUCT_INSTRUCT else "reasoning"
+        mode = "blend" if client.CONSTRUCT_BLEND else "pure"
+        construct_str = f"{client.ACTIVE_CONSTRUCT} ({mode}, {kind})"
+    holo_str = (
+        f"ON ({'instruct' if client.HOLODECK_INSTRUCT else 'reasoning'})"
+        if client.HOLODECK_ON else "OFF"
+    )
+    active_main = client.reason_tag_for_task("main", reason=config.THINKING_ENABLED)
+    return "\n".join([
+        f"  · [REASONING & COGNITIVE MODES] tags: {'ON' if client.REASON_TAGS_ON else 'OFF'} "
+        f"(source: {client.REASON_TAGS_SOURCE}) | thinking: {'ON' if config.THINKING_ENABLED else 'OFF'} "
+        f"| preset: {client.active_reason_preset()}",
+        f"    Active construct: {construct_str} | Holodeck: {holo_str} | "
+        f"Panel detail: {'ON' if client.REASON_PANEL_DETAIL else 'OFF'} | "
+        f"Prompt cache: {client.CACHE_PROMPT_MODE}",
+        f"    Effective main reply tag: {active_main}",
+        f"    Task tags:",
+        f"      main       = {client.REASON_TAG_MAIN:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['main']}",
+        f"      background = {client.REASON_TAG_BACKGROUND:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['background']}",
+        f"      critic     = {client.REASON_TAG_CRITIC:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['critic']}",
+        f"      dream      = {client.REASON_TAG_DREAM:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['dream']}",
+        f"      claude     = {client.REASON_TAG_CLAUDE:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['claude']}",
+        f"      router     = {client.REASON_TAG_ROUTER:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['router']}",
+        f"      off        = {client.REASON_TAG_OFF:<18} — {turbo_brilliance.REASON_TASK_DESCRIPTIONS['off']}",
+        "    Usage:",
+        "      /reason                       show this status",
+        "      /reason list                  list all 41 Turbo-Brilliance modes",
+        "      /reason preset <name>         apply preset (default|jarvis|cognitive|panel|coder|instruct|max)",
+        "      /reason cache <auto|on|off>   control llama.cpp cache_prompt policy",
+        "      /reason <mode>                set main reply mode (e.g. /reason stark, /reason deeptree, /reason ipkd)",
+        "      /reason <task> <mode>         set mode for main|background|critic|dream|claude|router|off",
+        "      /reason detail [on|off]       toggle 'Show the work of all panelists/agents'",
+        "      /reason tags [on|off|auto]    enable/disable/auto-detect {REASON:...} tag injection",
+    ])
+
+
+def _handle_reason_cmd(arg: str) -> str:
+    parts = (arg or "").strip().split()
+    if not parts or parts[0].lower() in ("show", "status"):
+        return _format_reason_status()
+    sub = parts[0].lower()
+    if sub in ("list", "modes", "catalog"):
+        return turbo_brilliance.format_mode_catalog_text(client.SUPPORTED_REASON_MODES)
+    if sub in ("preset", "presets"):
+        if len(parts) == 1 or parts[1].lower() in ("list", "show"):
+            return turbo_brilliance.format_preset_catalog_text(client.active_reason_preset())
+        pname, preset = turbo_brilliance.resolve_reason_preset(parts[1])
+        if preset is None:
+            valid = ", ".join(turbo_brilliance.REASON_PRESETS.keys())
+            return f"  · unknown preset '{parts[1]}' (available: {valid})"
+        tasks = preset["tasks"]
+        client.REASON_TAG_MAIN = tasks["main"]
+        client.REASON_TAG_BACKGROUND = tasks["background"]
+        client.REASON_TAG_CRITIC = tasks["critic"]
+        client.REASON_TAG_DREAM = tasks["dream"]
+        client.REASON_TAG_CLAUDE = tasks["claude"]
+        client.REASON_TAG_ROUTER = tasks["router"]
+        client.REASON_TAG_OFF = tasks["off"]
+        client.REASON_TAGS_ON = True
+        client.REASON_TAGS_SOURCE = f"preset ({pname})"
+        client.save_reason_state()
+        return (
+            f"  · applied reason preset '{pname}' ({preset['title']}): "
+            f"main={client.REASON_TAG_MAIN} bg={client.REASON_TAG_BACKGROUND} "
+            f"critic={client.REASON_TAG_CRITIC} dream={client.REASON_TAG_DREAM} "
+            f"claude={client.REASON_TAG_CLAUDE}"
+        )
+    if sub == "cache":
+        if len(parts) > 1 and parts[1].lower() in ("auto", "on", "off", "true", "false", "1", "0"):
+            client.CACHE_PROMPT_MODE = client._normalize_cache_prompt_mode(parts[1])
+            client.save_reason_state()
+            return f"  · prompt cache policy set to '{client.CACHE_PROMPT_MODE}'"
+        return (
+            f"  · prompt cache policy: {client.CACHE_PROMPT_MODE} "
+            "(usage: /reason cache <auto|on|off>)"
+        )
+    if sub == "detail":
+        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+            client.REASON_PANEL_DETAIL = parts[1].lower() == "on"
+        else:
+            client.REASON_PANEL_DETAIL = not client.REASON_PANEL_DETAIL
+        client.save_reason_state()
+        return f"  · panel/agent detail suffix {'ON' if client.REASON_PANEL_DETAIL else 'OFF'}"
+    if sub == "tags":
+        mode = parts[1].lower() if len(parts) > 1 else "toggle"
+        if mode == "on":
+            client.REASON_TAGS_ON, client.REASON_TAGS_SOURCE = True, "/reason tags on"
+        elif mode == "off":
+            client.REASON_TAGS_ON, client.REASON_TAGS_SOURCE = False, "/reason tags off"
+        elif mode == "auto":
+            client.REASON_TAGS_ON, client.REASON_TAGS_SOURCE = client._detect_reason_template(force_probe=True)
+        else:
+            client.REASON_TAGS_ON = not client.REASON_TAGS_ON
+            client.REASON_TAGS_SOURCE = "/reason tags"
+        client.save_reason_state()
+        return f"  · {{REASON:...}} tags {'ON' if client.REASON_TAGS_ON else 'OFF'} (source: {client.REASON_TAGS_SOURCE})"
+
+    task_map = {
+        "main": "main",
+        "reply": "main",
+        "background": "background",
+        "bg": "background",
+        "critic": "critic",
+        "critique": "critic",
+        "dream": "dream",
+        "claude": "claude",
+        "router": "router",
+        "off": "off",
+    }
+    if sub in task_map and len(parts) >= 2:
+        target = task_map[sub]
+        raw_mode = parts[1]
+        if not turbo_brilliance.is_valid_reason_mode(raw_mode, client.SUPPORTED_REASON_MODES):
+            return f"  · unknown reason mode '{raw_mode}' (try '/reason list')"
+        if target in ("critic", "dream", "claude", "router", "off"):
+            tag = (
+                turbo_brilliance.normalize_instruct_reason_tag(raw_mode)
+                if raw_mode.lower() in ("off", "ioff") or raw_mode.lower().startswith("i")
+                else turbo_brilliance.format_reason_tag(raw_mode)
+            )
+        else:
+            tag = turbo_brilliance.format_reason_tag(raw_mode)
+        if target == "main":
+            client.REASON_TAG_MAIN = tag
+        elif target == "background":
+            client.REASON_TAG_BACKGROUND = tag
+        elif target == "critic":
+            client.REASON_TAG_CRITIC = tag
+        elif target == "dream":
+            client.REASON_TAG_DREAM = tag
+        elif target == "claude":
+            client.REASON_TAG_CLAUDE = tag
+        elif target == "router":
+            client.REASON_TAG_ROUTER = tag
+        elif target == "off":
+            client.REASON_TAG_OFF = turbo_brilliance.normalize_instruct_reason_tag(raw_mode)
+            tag = client.REASON_TAG_OFF
+        client.REASON_TAGS_ON = True
+        client.REASON_TAGS_SOURCE = "/reason"
+        client.save_reason_state()
+        return f"  · reason mode for '{target}' set to {tag}"
+
+    # Shorthand: `/reason <preset>` or `/reason <mode>`
+    pname, preset = turbo_brilliance.resolve_reason_preset(sub)
+    if preset is not None and sub not in turbo_brilliance.MODE_CATALOG:
+        return _handle_reason_cmd(f"preset {pname}")
+    if not turbo_brilliance.is_valid_reason_mode(sub, client.SUPPORTED_REASON_MODES):
+        return f"  · unknown reason mode or subcommand '{sub}' (try '/reason list' or '/reason preset')"
+    client.REASON_TAG_MAIN = turbo_brilliance.format_reason_tag(sub)
+    client.REASON_TAGS_ON = True
+    client.REASON_TAGS_SOURCE = "/reason"
+    client.save_reason_state()
+    eff = client.reason_tag_for_task("main", reason=config.THINKING_ENABLED)
+    return f"  · main reason mode set to {client.REASON_TAG_MAIN} (effective={eff})"
+
+
+def _handle_construct_cmd(arg: str) -> str:
+    parts = (arg or "").strip().split()
+    if not parts or parts[0].lower() in ("list", "show", "status"):
+        return turbo_brilliance.format_construct_catalog_text(
+            client.ACTIVE_CONSTRUCT,
+            blend=client.CONSTRUCT_BLEND,
+            instruct=client.CONSTRUCT_INSTRUCT,
+        )
+    sub = parts[0].lower()
+    if sub in ("off", "none", "clear"):
+        prev = client.ACTIVE_CONSTRUCT
+        client.ACTIVE_CONSTRUCT = ""
+        client.save_reason_state()
+        return f"  · AI Construct deactivated (was: {prev or 'none'})"
+    base_mode, is_inst = turbo_brilliance.parse_reason_tag_mode(sub)
+    if base_mode not in turbo_brilliance.CONSTRUCT_NAMES:
+        return f"  · unknown AI Construct '{sub}' (try '/construct list')"
+    blend = client.CONSTRUCT_BLEND
+    instruct = is_inst
+    for opt in (p.lower() for p in parts[1:]):
+        if opt == "blend":
+            blend = True
+        elif opt == "pure":
+            blend = False
+        elif opt in ("instruct", "i", "fast"):
+            instruct = True
+        elif opt in ("reason", "reasoning", "think"):
+            instruct = False
+    client.ACTIVE_CONSTRUCT = base_mode
+    client.CONSTRUCT_BLEND = blend
+    client.CONSTRUCT_INSTRUCT = instruct
+    client.HOLODECK_ON = False
+    client.REASON_TAGS_ON = True
+    client.save_reason_state()
+    eff = client.reason_tag_for_task("main", reason=config.THINKING_ENABLED)
+    mode_label = "blend with JARVS" if blend else "pure construct persona"
+    return f"  · AI Construct '{base_mode}' activated (tag={eff}, framing={mode_label})"
+
+
+def _handle_holodeck_cmd(arg: str) -> str:
+    parts = (arg or "").strip().split()
+    sub = parts[0].lower() if parts else "toggle"
+    if sub in ("off", "stop", "exit", "0"):
+        client.HOLODECK_ON = False
+        client.save_reason_state()
+        return "  · Holodeck simulation OFF"
+    if sub == "status":
+        return f"  · Holodeck: {'ON' if client.HOLODECK_ON else 'OFF'} (tag={client.reason_tag_for_task('main')})"
+    instruct = client.HOLODECK_INSTRUCT
+    for p in (x.lower() for x in parts):
+        if p in ("instruct", "iholodeck", "fast"):
+            instruct = True
+        elif p in ("reason", "reasoning", "holodeck", "think"):
+            instruct = False
+    if sub == "toggle" and not parts:
+        client.HOLODECK_ON = not client.HOLODECK_ON
+    else:
+        client.HOLODECK_ON = True
+    client.HOLODECK_INSTRUCT = instruct
+    if client.HOLODECK_ON:
+        client.REASON_TAGS_ON = True
+    client.save_reason_state()
+    return (
+        f"  · Holodeck mode {'ON' if client.HOLODECK_ON else 'OFF'} "
+        f"(tag={client.reason_tag_for_task('main')})"
+    )
 
 
 def dispatch_command(session: JarvsSession, line: str) -> str:
@@ -614,8 +892,25 @@ def dispatch_command(session: JarvsSession, line: str) -> str:
             p(f"  · {session.self_model.stats()}")
         if session.rules is not None:
             p(f"  · {session.rules.status()}")
+        p(f"  · reason: preset={client.active_reason_preset()}  "
+          f"main={client.reason_tag_for_task('main')}  "
+          f"thinking={'on' if config.THINKING_ENABLED else 'off'}  "
+          f"cache={client.CACHE_PROMPT_MODE}")
         p(f"  · model={config.MODEL}  slot_ctx={config.SLOT_CTX}  "
           f"turns={len(session.history)}")
+    elif cmd in ("think", "thinking"):
+        if arg.lower() in ("on", "off"):
+            config.THINKING_ENABLED = arg.lower() == "on"
+        else:
+            config.THINKING_ENABLED = not config.THINKING_ENABLED
+        p(f"  · thinking {'on' if config.THINKING_ENABLED else 'off'} "
+          f"(effective main tag={client.reason_tag_for_task('main')})")
+    elif cmd == "reason":
+        p(_handle_reason_cmd(arg))
+    elif cmd == "construct":
+        p(_handle_construct_cmd(arg))
+    elif cmd == "holodeck":
+        p(_handle_holodeck_cmd(arg))
     elif cmd == "voice":
         if arg.lower() in ("on", "off"):
             session.voice.set_enabled(arg.lower() == "on")
